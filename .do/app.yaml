@@ -43,11 +43,35 @@ services:
         type: SECRET
         value: jimo           # set a long random password
 
-      # --- Vision tagging (optional; can also be entered in the UI) ---
-      - key: ANTHROPIC_API_KEY
+      # --- Vision tagging via Ollama over Tailscale ---
+      - key: PHOTOSTUDIO_TAGGER
+        scope: RUN_TIME
+        value: ollama
+      - key: OLLAMA_URL
+        scope: RUN_TIME
+        value: http://100.x.y.z:11434   # Tailscale IP of the Ollama host (MagicDNS name also works)
+      - key: OLLAMA_MODEL
+        scope: RUN_TIME
+        value: llama3.2-vision          # a vision model you've `ollama pull`ed (e.g. llava, qwen2.5vl, gemma3)
+
+      # Auth key that joins this container to your tailnet. Use a REUSABLE +
+      # EPHEMERAL key, tagged (e.g. tag:appplatform) and ACL-locked to the
+      # Ollama node:11434. Generate at Tailscale admin → Settings → Keys.
+      - key: TS_AUTHKEY
         scope: RUN_TIME
         type: SECRET
-        value: REPLACE_ME           # sk-ant-...  (or delete this env entirely)
+        value: REPLACE_ME               # tskey-auth-...
+
+      # Route the app's outbound Ollama call through tailscaled's userspace proxy.
+      - key: http_proxy
+        scope: RUN_TIME
+        value: http://localhost:1055
+      - key: https_proxy
+        scope: RUN_TIME
+        value: http://localhost:1055
+      - key: no_proxy
+        scope: RUN_TIME
+        value: localhost,127.0.0.1
 
       # Data dir. NOTE: App Platform's filesystem is EPHEMERAL — anything under
       # /data is wiped on every deploy/restart. Treat sessions as disposable;
