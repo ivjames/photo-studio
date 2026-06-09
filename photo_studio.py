@@ -189,9 +189,12 @@ def run_detection(params):
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             is_blank, std, edge = blankness(gray)
             grays.append((pid, gray))
+            bx, by, bw, bh = bbox
             STATE["photos"].append({
                 "id": pid, "scan_id": scan["id"], "scan_name": scan["name"],
                 "index": i, "path": str(cpath), "bbox": bbox,
+                "origin_quad": [[float(bx), float(by)], [float(bx + bw), float(by)],
+                                [float(bx + bw), float(by + bh)], [float(bx), float(by + bh)]],
                 "w": crop.shape[1], "h": crop.shape[0],
                 "blank": bool(is_blank), "std": round(std, 1),
                 "rotation_cw": 0, "dup_group": None, "is_dup_copy": False,
@@ -423,6 +426,7 @@ def crop_manual():
         STATE["photos"].append({
             "id": pid, "scan_id": sid, "scan_name": scan["name"],
             "index": base + k, "path": str(cpath), "bbox": None,
+            "origin_quad": [[float(x), float(y)] for x, y in quad],
             "w": crop.shape[1], "h": crop.shape[0],
             "blank": bool(is_blank), "std": round(std, 1),
             "rotation_cw": 0, "dup_group": None, "is_dup_copy": False,
@@ -435,6 +439,25 @@ def crop_manual():
     recompute_duplicates()
     save_session()
     return jsonify({"photos": STATE["photos"], "added": added})
+
+
+@app.route("/api/delete_crop", methods=["POST"])
+def delete_crop():
+    """Delete a single crop: remove it from state, delete its file, and
+    recompute duplicates. Its dimmed region on the parent scan clears because
+    the editor derives dimming live from the remaining crops' origin_quads."""
+    pid = (request.json or {}).get("id")
+    p = next((x for x in STATE["photos"] if x["id"] == pid), None)
+    if not p:
+        return jsonify({"error": "not found"}), 404
+    try:
+        Path(p["path"]).unlink()
+    except OSError:
+        pass
+    STATE["photos"] = [x for x in STATE["photos"] if x["id"] != pid]
+    recompute_duplicates()
+    save_session()
+    return jsonify({"ok": True, "photos": STATE["photos"]})
 
 
 @app.route("/api/thumb/<pid>")
@@ -679,6 +702,14 @@ button.primary:hover{filter:brightness(1.08)}
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:4px 0;
   border-bottom:1px dotted var(--line)}
 .stat b{color:var(--accent)}
+.filelist{font-family:ui-monospace,monospace;font-size:11px;color:var(--mut);
+  max-height:140px;overflow:auto;margin-bottom:8px}
+.filelist .fl{display:flex;justify-content:space-between;gap:6px;padding:2px 0;
+  white-space:nowrap}
+.filelist .fl .nm{overflow:hidden;text-overflow:ellipsis}
+.filelist .fl .ct{color:var(--accent2);flex:0 0 auto}
+.filelist .hd{color:var(--ink);text-transform:uppercase;letter-spacing:1px;
+  font-size:10px;margin:2px 0 4px}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
@@ -739,13 +770,14 @@ button.primary:hover{filter:brightness(1.08)}
 <aside>
   <div class="group">
     <h3>1 · Source</h3>
-    <label>Folder of scans (local path)</label>
-    <input type="text" id="folder" placeholder="/Users/me/scans">
-    <div class="row" style="margin-top:8px"><button class="grow" onclick="loadFolder()" style="flex:1">Load folder</button></div>
+    <input type="file" id="fileInput" accept="image/*" multiple style="display:none" onchange="uploadFiles(this.files)">
+    <button class="primary" style="width:100%" onclick="document.getElementById('fileInput').click()">Choose scan images…</button>
     <div class="drop" id="drop">…or drop scan images here</div>
     <button onclick="clearSession()" style="width:100%;margin-top:8px">New session (clear)</button>
     <button onclick="openEditor()" style="width:100%;margin-top:8px">&#9986; Manual crop (draw boxes)</button>
   </div>
+  <!-- Detection / autocrop panel hidden until autocrop is fixed.
+       The detect() backend + JS remain; restore this block to re-enable.
   <div class="group">
     <h3>2 · Detection</h3>
     <label>Sensitivity <span id="sv">1.0</span></label>
@@ -757,14 +789,11 @@ button.primary:hover{filter:brightness(1.08)}
     <label class="row" style="gap:8px"><input type="checkbox" id="deskew" checked style="width:auto"> Deskew (rotate upright)</label>
     <button class="primary" style="width:100%;margin-top:12px" onclick="detect()">Detect photos</button>
   </div>
+  -->
   <div class="group">
-    <h3>3 · Export</h3>
+    <h3>2 · Export</h3>
     <button class="primary" style="width:100%" onclick="doDownload()">Download .zip</button>
-    <div class="note">Downloads corrected photos, blanks, and manifests to your computer. Works anywhere, including remote servers.</div>
-    <label style="margin-top:14px">Or save to a folder on the server</label>
-    <input type="text" id="outdir" placeholder="/path/on/server">
-    <button style="width:100%;margin-top:8px" onclick="doExport()">Save to server folder</button>
-    <div class="note">Writes to a path on the machine running the app — useful only for local runs.</div>
+    <div class="note">Downloads corrected photos, blanks, and manifests (CSV + JSON) to your computer.</div>
   </div>
   <div class="group">
     <h3>Summary</h3>
@@ -774,6 +803,11 @@ button.primary:hover{filter:brightness(1.08)}
     <div class="stat"><span>Duplicate copies</span><b id="nDup">0</b></div>
     <div class="stat"><span>Keeping</span><b id="nKeep">0</b></div>
   </div>
+  <div class="group">
+    <h3>Files</h3>
+    <div class="filelist" id="fileScans"></div>
+    <div class="filelist" id="fileCrops"></div>
+  </div>
 </aside>
 <main>
   <div class="toolbar">
@@ -781,7 +815,7 @@ button.primary:hover{filter:brightness(1.08)}
     <label class="row" style="margin:0;gap:6px"><input type="checkbox" id="showDup" style="width:auto" onchange="render()"> show duplicate copies</label>
   </div>
   <div id="grid" class="grid"></div>
-  <div id="empty" class="empty">Load a folder of scans, then hit <b>Detect photos</b>.</div>
+  <div id="empty" class="empty">Load or drop scans, then use <b>Manual crop</b> to draw boxes around each photo.</div>
 </main>
 </div>
 <div class="modal" id="editor">
@@ -794,6 +828,11 @@ button.primary:hover{filter:brightness(1.08)}
   <div class="efoot">
     <button onclick="removeLastQuad()">Remove last box</button>
     <span class="einfo" id="eCount"></span>
+    <label class="einfo" style="margin-left:10px">skew
+      <input type="range" id="skew" min="-15" max="15" step="0.1" value="0"
+             style="vertical-align:middle;width:160px" oninput="onSkew(this.value)"
+             disabled>
+      <span id="skewVal">0.0°</span></label>
     <button onclick="prevScan()">&lsaquo; Prev</button>
     <button onclick="nextScan()">Next &rsaquo;</button>
     <button class="primary" style="margin-left:auto" onclick="cropAll()">Crop all &amp; close</button>
@@ -834,16 +873,25 @@ async function api(url,body){
   if(body)o.body=JSON.stringify(body);
   const r=await fetch(url,o); return r.json();
 }
-async function loadFolder(){
-  setStatus('loading…',true);
-  const r=await api('/api/load_folder',{path:$("folder").value});
-  if(r.error){setStatus(r.error);return;}
-  scans=r.scans; $("nScans").textContent=scans.length; setStatus(scans.length+' scan(s) loaded');
+async function uploadFiles(fileList){
+  if(!fileList||!fileList.length){return;}
+  const fd=new FormData();
+  for(const f of fileList) fd.append('files',f);
+  setStatus('uploading '+fileList.length+' file(s)…',true);
+  try{
+    const r=await(await fetch('/api/upload',{method:'POST',body:fd})).json();
+    scans=r.scans; $("nScans").textContent=scans.length;
+    setStatus(scans.length+' scan(s) uploaded'); renderFiles();
+  }catch(e){ setStatus('upload error: '+e); }
 }
-function detectParams(){return{
-  sensitivity:parseFloat($("sens").value),
-  min_area_frac:parseFloat($("minarea").value)/100,
-  pad:parseInt($("pad").value), deskew:$("deskew").checked, dup_dist:10};}
+function detectParams(){
+  // Detection panel is hidden; fall back to defaults if its inputs are absent.
+  const val=(id,d)=>{const e=$(id); return e?e.value:d;};
+  const chk=(id,d)=>{const e=$(id); return e?e.checked:d;};
+  return{
+    sensitivity:parseFloat(val("sens",1.0)),
+    min_area_frac:parseFloat(val("minarea",1))/100,
+    pad:parseInt(val("pad",6)), deskew:chk("deskew",true), dup_dist:10};}
 async function detect(){
   if(!scans.length){setStatus('load a folder first');return;}
   setStatus('detecting…',true);
@@ -863,11 +911,16 @@ async function editTags(id){
   const v=prompt('Tags (comma-separated):',p.tags.join(', ')); if(v===null)return;
   const r=await api('/api/update',{id,tags:v}); p.tags=r.photo.tags; render();
 }
-async function doExport(){
-  setStatus('exporting…',true);
-  const r=await api('/api/export',{out_dir:$("outdir").value});
+async function editDesc(id){
+  const p=photos.find(x=>x.id===id);
+  const v=prompt('Description:',p.description||''); if(v===null)return;
+  const r=await api('/api/update',{id,description:v}); p.description=r.photo.description; render();
+}
+async function deleteCrop(id){
+  if(!confirm('Delete this crop? Its dimmed region on the scan will clear too.'))return;
+  const r=await api('/api/delete_crop',{id});
   if(r.error){setStatus(r.error);return;}
-  setStatus('exported '+r.exported+' photo(s) → '+r.out_dir);
+  photos=r.photos; setStatus('crop deleted'); render();
 }
 async function doDownload(){
   setStatus('building zip…',true);
@@ -893,6 +946,24 @@ function counts(){
   $("nBlank").textContent=photos.filter(p=>p.blank).length;
   $("nDup").textContent=photos.filter(p=>p.is_dup_copy).length;
   $("nKeep").textContent=photos.filter(p=>p.status==='keep').length;
+  renderFiles();
+}
+function renderFiles(){
+  // Uploaded scans, each with how many crops came from it.
+  const fs=$("fileScans"), fc=$("fileCrops");
+  if(fs){
+    fs.innerHTML='<div class="hd">Uploaded ('+scans.length+')</div>'+
+      (scans.length? scans.map(s=>{
+        const n=photos.filter(p=>p.scan_id===s.id).length;
+        return `<div class="fl"><span class="nm">${s.name}</span><span class="ct">${n} crop${n!==1?'s':''}</span></div>`;
+      }).join('') : '<div class="fl"><span class="nm">none yet</span></div>');
+  }
+  if(fc){
+    fc.innerHTML='<div class="hd">Created ('+photos.length+')</div>'+
+      (photos.length? photos.map(p=>
+        `<div class="fl"><span class="nm">${p.scan_name} · #${p.index}</span><span class="ct">${p.w}×${p.h}</span></div>`
+      ).join('') : '<div class="fl"><span class="nm">none yet</span></div>');
+  }
 }
 function render(){
   counts();
@@ -905,22 +976,22 @@ function render(){
       p.is_dup_copy?`<span class="badge dup">dup</span>`:'',
       p.blank?`<span class="badge blank">blank</span>`:''].join('');
     const tags=p.tags.map(t=>`<span class="tag">${t}</span>`).join('');
-    const dec=p.decade?`${p.decade}${p.decade_confidence?' ('+p.decade_confidence[0]+')':''}`:'';
-    const ppl=(p.people_count!=null)?`${p.people_count}p`:'';
     return `<div class="card ${p.status==='skip'?'skip':''}">
-      <div class="thumbwrap"><img src="/api/thumb/${p.id}?r=${p.rotation_cw}" loading="lazy" onclick="openLightbox('${p.id}')">
+      <div class="thumbwrap"><img src="/api/thumb/${p.id}?r=${p.rotation_cw}" loading="lazy" onclick="openLightbox('${p.id}')" title="Click to view full size">
         <div class="badges">${badges}</div></div>
       <div class="cardbody">
         <div class="nm">${p.scan_name} · #${p.index}</div>
-        <div class="desc">${p.description||'<span style="color:var(--mut)">untagged</span>'}</div>
+        <div class="desc">${p.description||'<span style="color:var(--mut)">no description</span>'}</div>
         <div class="tags">${tags}</div>
-        <div class="meta"><span>${dec}${p.added_by&&p.added_by!=='local'?' · '+p.added_by:''}</span><span>${p.scene_type} ${ppl}</span></div>
+        <div class="meta"><span>${p.added_by&&p.added_by!=='local'?p.added_by:''}</span><span></span></div>
       </div>
       <div class="cardctl">
         <button onclick="rotate('${p.id}',-1)">↺</button>
         <button onclick="rotate('${p.id}',1)">↻</button>
+        <button class="grow" onclick="editDesc('${p.id}')">desc</button>
         <button class="grow" onclick="editTags('${p.id}')">tags</button>
         <button onclick="toggleKeep('${p.id}')">${p.status==='keep'?'keep':'skip'}</button>
+        <button onclick="deleteCrop('${p.id}')" title="Delete crop">🗑</button>
       </div></div>`;
   }).join('');
 }
@@ -928,12 +999,7 @@ function render(){
 const drop=$("drop");
 ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
-drop.addEventListener('drop',async ev=>{
-  const fd=new FormData(); for(const f of ev.dataTransfer.files)fd.append('files',f);
-  setStatus('uploading…',true);
-  const r=await(await fetch('/api/upload',{method:'POST',body:fd})).json();
-  scans=r.scans; $("nScans").textContent=scans.length; setStatus(scans.length+' scan(s) uploaded');
-});
+drop.addEventListener('drop',ev=>{ uploadFiles(ev.dataTransfer.files); });
 async function clearSession(){
   if(!confirm('Clear the current session and delete its cropped files?'))return;
   await api('/api/clear'); photos=[]; scans=[];
@@ -945,13 +1011,16 @@ async function init(){
     const r=await(await fetch('/api/state')).json();
     scans=r.scans||[]; photos=r.photos||[]; lastRev=r.rev||0;
     $("nScans").textContent=scans.length;
+    renderFiles();
     if(photos.length){ setStatus('restored '+photos.length+' photo(s) from last session'); render(); }
   }catch(e){}
   try{
     const c=await(await fetch('/api/config')).json();
-    if(c.multiuser){ $("status").textContent='signed in as '+c.user; }
+    if(c.multiuser){
+      $("status").textContent='signed in as '+c.user;
+      setInterval(syncShared, 5000);   // shared workspace: pick up others' changes
+    }
   }catch(e){}
-  setInterval(syncShared, 5000);   // shared workspace: pick up others' changes
 }
 async function syncShared(){
   if($("editor").classList.contains('open'))return;  // don't disturb active editing
@@ -964,18 +1033,35 @@ async function syncShared(){
   }catch(e){}
 }
 // ---- manual crop editor ----
-let ed={i:0, quads:{}, pts:[], img:null, scale:1, drag:null, newbox:null, sel:null};
+let ed={i:0, quads:{}, angles:{}, pts:[], img:null, scale:1, drag:null, newbox:null, sel:null};
+// Rotate a box's 4 base (axis-aligned) corners about their centre by deg.
+function rotatedQuad(base, deg){
+  if(!deg) return base.map(p=>[p[0],p[1]]);
+  const cx=(base[0][0]+base[2][0])/2, cy=(base[0][1]+base[2][1])/2;
+  const r=deg*Math.PI/180, cos=Math.cos(r), sin=Math.sin(r);
+  return base.map(([x,y])=>{
+    const dx=x-cx, dy=y-cy;
+    return [cx+dx*cos-dy*sin, cy+dx*sin+dy*cos];
+  });
+}
+// The corners to draw / send for box qi on the current scan (base + tilt).
+function dispQuad(sid, qi){
+  const base=ed.quads[sid][qi];
+  const deg=(ed.angles[sid]&&ed.angles[sid][qi])||0;
+  return rotatedQuad(base, deg);
+}
 const cv=$("cv"), ctx=cv.getContext('2d');
 function openEditor(){
   if(!scans.length){setStatus('load a folder or drop scans first');return;}
-  ed.i=0; ed.quads={}; ed.pts=[]; $("editor").classList.add('open'); loadEScan();
+  ed.i=0; ed.quads={}; ed.angles={}; ed.pts=[]; $("editor").classList.add('open'); loadEScan();
 }
 function closeEditor(){ $("editor").classList.remove('open'); }
 function curScan(){ return scans[ed.i]; }
 function loadEScan(){
   const s=curScan();
   $("eScanName").textContent=s.name+" ("+(ed.i+1)+"/"+scans.length+")";
-  ed.pts=[]; ed.sel=null; ed.newbox=null; if(!ed.quads[s.id])ed.quads[s.id]=[];
+  ed.pts=[]; ed.sel=null; ed.newbox=null; if(!ed.quads[s.id])ed.quads[s.id]=[]; if(!ed.angles[s.id])ed.angles[s.id]=[];
+  if(typeof syncSkewUI==='function') syncSkewUI();
   ed.img=new Image();
   ed.img.onload=()=>{
     const maxW=Math.min(window.innerWidth-60,1000), maxH=window.innerHeight-170;
@@ -991,9 +1077,12 @@ function eCanvasPos(e){
   return [(e.clientX-r.left)*(cv.width/r.width), (e.clientY-r.top)*(cv.height/r.height)];
 }
 function eFindCorner(cx,cy){
-  const sc=ed.scale, HIT=12, qs=ed.quads[curScan().id]||[];
-  for(let qi=0;qi<qs.length;qi++)for(let pi=0;pi<4;pi++){
-    if(Math.hypot(qs[qi][pi][0]*sc-cx, qs[qi][pi][1]*sc-cy)<=HIT) return {q:qi,p:pi};
+  const sc=ed.scale, HIT=12, sid=curScan().id, qs=ed.quads[sid]||[];
+  for(let qi=0;qi<qs.length;qi++){
+    const dq=dispQuad(sid,qi);
+    for(let pi=0;pi<4;pi++){
+      if(Math.hypot(dq[pi][0]*sc-cx, dq[pi][1]*sc-cy)<=HIT) return {q:qi,p:pi};
+    }
   }
   for(let pi=0;pi<ed.pts.length;pi++){
     if(Math.hypot(ed.pts[pi][0]*sc-cx, ed.pts[pi][1]*sc-cy)<=HIT) return {pts:true,p:pi};
@@ -1004,6 +1093,7 @@ cv.addEventListener('pointerdown',e=>{
   const [cx,cy]=eCanvasPos(e); const hit=eFindCorner(cx,cy);
   if(hit){ ed.drag=hit; ed.sel=hit; }
   else { ed.newbox={x0:cx/ed.scale, y0:cy/ed.scale, x1:cx/ed.scale, y1:cy/ed.scale}; ed.sel=null; }
+  syncSkewUI();
   cv.setPointerCapture(e.pointerId);
 });
 cv.addEventListener('pointermove',e=>{
@@ -1012,7 +1102,9 @@ cv.addEventListener('pointermove',e=>{
     // Rigid rectangle resize: the dragged corner moves to the pointer, the
     // diagonally-opposite corner stays anchored, and the two neighbours are
     // recomputed so the box stays axis-aligned. Order is [TL,TR,BR,BL].
-    const q=ed.quads[curScan().id][ed.drag.q];
+    // Resizing returns the box to axis-aligned (angle reset); apply tilt after.
+    const sid=curScan().id, q=ed.quads[sid][ed.drag.q];
+    if(ed.angles[sid]) ed.angles[sid][ed.drag.q]=0;
     const i=ed.drag.p, opp=(i+2)%4;
     const ax=q[opp][0], ay=q[opp][1];       // anchored opposite corner
     const nx=cx/ed.scale, ny=cy/ed.scale;    // new dragged corner
@@ -1027,13 +1119,14 @@ cv.addEventListener('pointermove',e=>{
   }
 });
 function ePointerUp(e){
-  if(ed.drag){ ed.drag=null; return; }
+  if(ed.drag){ ed.drag=null; syncSkewUI(); return; }
   if(ed.newbox){
     const b=ed.newbox; ed.newbox=null;
     const x0=Math.min(b.x0,b.x1), x1=Math.max(b.x0,b.x1);
     const y0=Math.min(b.y0,b.y1), y1=Math.max(b.y0,b.y1);
     if((x1-x0)>20 && (y1-y0)>20)
       ed.quads[curScan().id].push([[x0,y0],[x1,y0],[x1,y1],[x0,y1]]);
+      ed.angles[curScan().id].push(0);
     redraw();
   }
 }
@@ -1042,24 +1135,75 @@ cv.addEventListener('pointercancel',()=>{ed.drag=null; ed.newbox=null;});
 function eSelPoint(){
   if(!ed.sel)return null;
   if(ed.sel.pts) return ed.pts[ed.sel.p];
-  const q=ed.quads[curScan().id]; return q&&q[ed.sel.q]?q[ed.sel.q][ed.sel.p]:null;
+  const sid=curScan().id, q=ed.quads[sid];
+  if(!(q&&q[ed.sel.q])) return null;
+  return dispQuad(sid, ed.sel.q)[ed.sel.p];   // displayed (rotated) position
+}
+// Sync the skew slider to the currently-selected box (enable + show its angle).
+function syncSkewUI(){
+  const s=$("skew"), v=$("skewVal");
+  if(ed.sel && !ed.sel.pts){
+    const sid=curScan().id, a=(ed.angles[sid]&&ed.angles[sid][ed.sel.q])||0;
+    s.disabled=false; s.value=a; v.textContent=a.toFixed(1)+'°';
+  } else {
+    s.disabled=true; s.value=0; v.textContent='0.0°';
+  }
+}
+// Slider moved: set the selected box's tilt and redraw.
+function onSkew(val){
+  if(!ed.sel || ed.sel.pts) return;
+  const sid=curScan().id, a=parseFloat(val);
+  if(!ed.angles[sid]) ed.angles[sid]=[];
+  ed.angles[sid][ed.sel.q]=a;
+  $("skewVal").textContent=a.toFixed(1)+'°';
+  redraw();
 }
 document.addEventListener('keydown',e=>{
   if(!$("editor").classList.contains('open')||!ed.sel)return;
   const map={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]};
   if(!(e.key in map))return;
   e.preventDefault();
-  const pt=eSelPoint(); if(!pt){ed.sel=null;return;}
   const step=e.shiftKey?10:1, d=map[e.key];
+  // Nudge a committed box corner: move it, keep the opposite corner anchored,
+  // and rebuild as an axis-aligned rectangle (matches rigid drag behaviour).
+  if(!ed.sel.pts){
+    const q=ed.quads[curScan().id]&&ed.quads[curScan().id][ed.sel.q];
+    if(!q){ed.sel=null;return;}
+    const i=ed.sel.p, opp=(i+2)%4;
+    const ax=q[opp][0], ay=q[opp][1];
+    const nx=q[i][0]+d[0]*step, ny=q[i][1]+d[1]*step;
+    const x0=Math.min(ax,nx), x1=Math.max(ax,nx);
+    const y0=Math.min(ay,ny), y1=Math.max(ay,ny);
+    q[0]=[x0,y0]; q[1]=[x1,y0]; q[2]=[x1,y1]; q[3]=[x0,y1];
+    redraw(); return;
+  }
+  const pt=eSelPoint(); if(!pt){ed.sel=null;return;}
   pt[0]+=d[0]*step; pt[1]+=d[1]*step; redraw();
 });
 function redraw(){
   if(!ed.img)return;
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.drawImage(ed.img,0,0,cv.width,cv.height);
-  const sc=ed.scale, qs=ed.quads[curScan().id]||[];
+  const sc=ed.scale, sid=curScan().id, qs=ed.quads[sid]||[];
+  // Dim regions already cropped from THIS scan (live from stored origin_quads).
+  // Deleting a crop removes its photo, so its dim disappears on next redraw.
+  const done=(typeof photos!=='undefined'?photos:[]).filter(
+    p=>p.scan_id===sid && Array.isArray(p.origin_quad) && p.origin_quad.length===4);
+  if(done.length){
+    ctx.save();
+    done.forEach(p=>{
+      ctx.beginPath();
+      p.origin_quad.forEach((pt,k)=>{const X=pt[0]*sc,Y=pt[1]*sc; k?ctx.lineTo(X,Y):ctx.moveTo(X,Y);});
+      ctx.closePath();
+      ctx.fillStyle='rgba(8,7,5,.62)';     // darken the already-used area
+      ctx.fill();
+      ctx.strokeStyle='rgba(224,162,59,.55)'; ctx.lineWidth=1.5; ctx.stroke();
+    });
+    ctx.restore();
+  }
   ctx.lineWidth=3; ctx.font='bold 20px ui-monospace,monospace';
-  qs.forEach((q,idx)=>{
+  qs.forEach((base,idx)=>{
+    const q=dispQuad(sid,idx);
     ctx.strokeStyle='#7fae6f'; ctx.fillStyle='rgba(127,174,111,.18)';
     ctx.beginPath();
     q.forEach((p,k)=>{const X=p[0]*sc,Y=p[1]*sc; k?ctx.lineTo(X,Y):ctx.moveTo(X,Y);});
@@ -1084,17 +1228,20 @@ function redraw(){
 }
 function undoPoint(){
   if(ed.pts.length)ed.pts.pop();
-  else{const q=ed.quads[curScan().id]; if(q&&q.length)q.pop();}
+  else{const sid=curScan().id, q=ed.quads[sid];
+       if(q&&q.length){q.pop(); if(ed.angles[sid])ed.angles[sid].pop();}}
   ed.sel=null; redraw();
 }
-function removeLastQuad(){ const q=ed.quads[curScan().id]; if(q&&q.length)q.pop(); ed.sel=null; redraw(); }
+function removeLastQuad(){ const sid=curScan().id, q=ed.quads[sid];
+  if(q&&q.length){q.pop(); if(ed.angles[sid])ed.angles[sid].pop();} ed.sel=null; redraw(); }
 function prevScan(){ if(ed.i>0){ed.i--; loadEScan();} }
 function nextScan(){ if(ed.i<scans.length-1){ed.i++; loadEScan();} }
 async function cropAll(){
   setStatus('cropping…',true);
   let n=0;
   for(const sid of Object.keys(ed.quads)){
-    const quads=ed.quads[sid]; if(!quads.length)continue;
+    const base=ed.quads[sid]; if(!base.length)continue;
+    const quads=base.map((_,qi)=>dispQuad(sid,qi));   // apply per-box tilt
     const r=await api('/api/crop_manual',{scan_id:sid,quads}); n+=r.added||0;
   }
   closeEditor();
