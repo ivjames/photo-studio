@@ -41,7 +41,7 @@ services:
       - key: PHOTOSTUDIO_PASSWORD
         scope: RUN_TIME
         type: SECRET
-        value: REPLACE_ME           # set a long random password
+        value: jimo           # set a long random password
 
       # --- Vision tagging (optional; can also be entered in the UI) ---
       - key: ANTHROPIC_API_KEY
@@ -57,6 +57,6 @@ services:
         value: /data
 
 domains:
-  - domain: photos.example.com       # replace with your subdomain
+  - domain: photos.lab980.com       # replace with your subdomain
     type: PRIMARY
-    zone: example.com                # the parent zone hosted in DO DNS
+    zone: lab980.com                # the parent zone hosted in DO DNS
