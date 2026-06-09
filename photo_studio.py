@@ -24,6 +24,7 @@ import csv
 import hmac
 import io
 import json
+import math
 import os
 import tempfile
 import threading
@@ -197,7 +198,7 @@ def run_detection(params):
                                 [float(bx + bw), float(by + bh)], [float(bx), float(by + bh)]],
                 "w": crop.shape[1], "h": crop.shape[0],
                 "blank": bool(is_blank), "std": round(std, 1),
-                "rotation_cw": 0, "dup_group": None, "is_dup_copy": False,
+                "rotation_cw": 0, "tilt_cw": 0, "dup_group": None, "is_dup_copy": False,
                 "face_hint_cw": None,
                 "status": "skip" if is_blank else "keep",
                 "tags": [], "description": "", "scene_type": "",
@@ -372,6 +373,11 @@ def recompute_duplicates(dup_dist=10):
     seen = set()
     for p, gp in zip(photos, groups):
         p["dup_group"] = int(gp)
+        if p.get("force_keep"):
+            # User marked this as NOT a duplicate — never auto-flag it, and
+            # don't let it claim the group's "original" slot.
+            p["is_dup_copy"] = False
+            continue
         p["is_dup_copy"] = gp in seen
         seen.add(gp)
 
@@ -429,7 +435,7 @@ def crop_manual():
             "origin_quad": [[float(x), float(y)] for x, y in quad],
             "w": crop.shape[1], "h": crop.shape[0],
             "blank": bool(is_blank), "std": round(std, 1),
-            "rotation_cw": 0, "dup_group": None, "is_dup_copy": False,
+            "rotation_cw": 0, "tilt_cw": 0, "dup_group": None, "is_dup_copy": False,
             "face_hint_cw": hint, "status": "skip" if is_blank else "keep",
             "tags": [], "description": "", "scene_type": "",
             "people_count": None, "decade": "", "decade_confidence": "",
@@ -458,6 +464,73 @@ def delete_crop():
     recompute_duplicates()
     save_session()
     return jsonify({"ok": True, "photos": STATE["photos"]})
+
+
+def _rotate_quad(quad, deg):
+    """Rotate a 4-point quad about its centroid by deg (clockwise in image
+    coords). Returns a new list of [x, y]."""
+    if not deg:
+        return [[float(x), float(y)] for x, y in quad]
+    cx = sum(p[0] for p in quad) / 4.0
+    cy = sum(p[1] for p in quad) / 4.0
+    r = math.radians(deg)
+    cos, sin = math.cos(r), math.sin(r)
+    out = []
+    for x, y in quad:
+        dx, dy = x - cx, y - cy
+        out.append([cx + dx * cos - dy * sin, cy + dx * sin + dy * cos])
+    return out
+
+
+@app.route("/api/undupe", methods=["POST"])
+def undupe():
+    """Mark a photo as NOT a duplicate (for highly-similar-but-different shots
+    the hash grouped together). Sets force_keep so dedup won't re-flag it, and
+    restores it to 'keep' if it had been auto-skipped as a dup copy."""
+    pid = (request.json or {}).get("id")
+    p = next((x for x in STATE["photos"] if x["id"] == pid), None)
+    if not p:
+        return jsonify({"error": "not found"}), 404
+    p["force_keep"] = True
+    p["is_dup_copy"] = False
+    if p["status"] == "skip" and not p["blank"]:
+        p["status"] = "keep"
+    save_session()
+    return jsonify({"ok": True, "photo": p})
+
+
+@app.route("/api/retilt", methods=["POST"])
+def retilt():
+    """Re-crop a photo from its PARENT SCAN at a new absolute tilt angle, so the
+    result stays clean (no corner gaps, no compounding resample). Uses the
+    stored origin_quad (the as-cropped region) rotated about its centre."""
+    j = request.json or {}
+    pid = j.get("id")
+    try:
+        deg = float(j.get("tilt_cw", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "bad angle"}), 400
+    p = next((x for x in STATE["photos"] if x["id"] == pid), None)
+    if not p:
+        return jsonify({"error": "not found"}), 404
+    base = p.get("origin_quad")
+    if not (isinstance(base, list) and len(base) == 4):
+        return jsonify({"error": "no source region stored for this crop"}), 400
+    scan = next((s for s in STATE["scans"] if s["id"] == p["scan_id"]), None)
+    if not scan or not Path(scan["path"]).exists():
+        return jsonify({"error": "parent scan unavailable"}), 400
+    img = cv2.imread(scan["path"])
+    if img is None:
+        return jsonify({"error": "parent scan unreadable"}), 400
+    quad = _rotate_quad(base, deg)
+    crop = warp_quad(img, quad)
+    if crop is None or crop.size == 0:
+        return jsonify({"error": "re-crop produced empty image"}), 400
+    cv2.imwrite(p["path"], crop)            # overwrite in place (same id/path)
+    p["tilt_cw"] = deg
+    p["w"], p["h"] = crop.shape[1], crop.shape[0]
+    save_session()
+    return jsonify({"ok": True, "photo": p})
 
 
 @app.route("/api/thumb/<pid>")
@@ -675,6 +748,8 @@ header{display:flex;align-items:center;gap:18px;padding:14px 22px;
   border-bottom:1px solid var(--line);background:rgba(20,19,14,.8);
   position:sticky;top:0;z-index:20;backdrop-filter:blur(6px)}
 h1{font-size:20px;margin:0;letter-spacing:.5px}
+.topnav{display:flex;gap:8px;margin-left:18px}
+.topnav button{font-size:13px;padding:7px 12px}
 h1 .dot{color:var(--accent)}
 .sub{color:var(--mut);font-size:13px}
 .wrap{display:grid;grid-template-columns:300px 1fr;gap:0;min-height:calc(100vh - 56px)}
@@ -763,7 +838,10 @@ button.primary:hover{filter:brightness(1.08)}
 <body>
 <header>
   <h1>Photo<span class="dot">.</span>Studio</h1>
-  <span class="sub">scan &rarr; crop &rarr; tag &rarr; export</span>
+  <nav class="topnav">
+    <button onclick="openEditor()" title="Go through scans and draw crop boxes">✂ Crop scans</button>
+    <button onclick="gotoReview()" title="Review crops, tilt &amp; tag">▦ Review crops (<span id="navCount">0</span>)</button>
+  </nav>
   <span id="status" class="sub" style="margin-left:auto"></span>
 </header>
 <div class="wrap">
@@ -821,20 +899,21 @@ button.primary:hover{filter:brightness(1.08)}
 <div class="modal" id="editor">
   <div class="ehead">
     <h2>Manual crop — <span id="eScanName"></span></h2>
-    <span class="einfo">Drag a box around each photo (corner to opposite corner). Drag a handle to adjust a corner; tap a corner then use arrow keys to nudge (Shift = 10px).</span>
+    <span class="einfo">Drag a box around each photo (corner to opposite corner). Drag a handle to resize; tap a corner then arrow-keys to nudge (Shift = 10px). Zoom for precision; straighten tilt later in Review.</span>
     <button style="margin-left:auto" onclick="closeEditor()">Close</button>
   </div>
-  <div class="ebody"><canvas id="cv"></canvas></div>
+  <div class="ebody" id="ebody"><canvas id="cv"></canvas></div>
   <div class="efoot">
     <button onclick="removeLastQuad()">Remove last box</button>
     <span class="einfo" id="eCount"></span>
-    <label class="einfo" style="margin-left:10px">skew
-      <input type="range" id="skew" min="-15" max="15" step="0.1" value="0"
-             style="vertical-align:middle;width:160px" oninput="onSkew(this.value)"
-             disabled>
-      <span id="skewVal">0.0°</span></label>
+    <label class="einfo" style="margin-left:10px">zoom
+      <input type="range" id="zoom" min="1" max="5" step="0.1" value="1"
+             style="vertical-align:middle;width:140px" oninput="onZoom(this.value)">
+      <span id="zoomVal">100%</span></label>
+    <button onclick="zoomReset()">Fit</button>
     <button onclick="prevScan()">&lsaquo; Prev</button>
     <button onclick="nextScan()">Next &rsaquo;</button>
+    <span class="einfo" id="cropProgress" style="margin-left:8px"></span>
     <button class="primary" style="margin-left:auto" onclick="cropAll()">Crop all &amp; close</button>
   </div>
 </div>
@@ -842,6 +921,12 @@ button.primary:hover{filter:brightness(1.08)}
   <div class="lbhead">
     <h2 id="lbName"></h2>
     <span class="lbmeta" id="lbMeta"></span>
+    <label class="lbmeta" style="margin-left:14px">tilt
+      <input type="range" id="lbTilt" min="-15" max="15" step="0.1" value="0"
+             style="vertical-align:middle;width:160px" oninput="lbTiltPreview(this.value)"
+             onchange="lbTiltApply(this.value)">
+      <span id="lbTiltVal">0.0°</span></label>
+    <button onclick="lbTiltReset()" class="lbmeta" style="margin-left:6px">reset</button>
     <button style="margin-left:auto" onclick="closeLightbox(event,true)">Close ✕</button>
   </div>
   <div class="lbbody"><img id="lbImg" src="" alt=""></div>
@@ -849,20 +934,41 @@ button.primary:hover{filter:brightness(1.08)}
 <script>
 let photos=[], scans=[];
 const $=id=>document.getElementById(id);
-function setStatus(t,busy){ $("status").innerHTML = busy?'<span class="spin"></span> '+t : t; }
+function setStatus(t,busy){
+  const el=$("status");
+  if(busy){ el.innerHTML='<span class="spin"></span> '+t;
+    el.style.color='var(--accent)'; el.style.fontWeight='600'; }
+  else { el.textContent=t; el.style.color=''; el.style.fontWeight=''; }
+}
+let lbId=null;
 function openLightbox(id){
   const p=photos.find(x=>x.id===id); if(!p)return;
-  $("lbImg").src='/api/full/'+p.id+'?r='+p.rotation_cw;
+  lbId=id;
+  $("lbImg").src='/api/full/'+p.id+'?r='+p.rotation_cw+'&t='+Date.now();
   $("lbName").textContent=p.scan_name+' · #'+p.index;
-  const dec=p.decade?(' · '+p.decade):'';
-  $("lbMeta").textContent=p.w+'×'+p.h+' px · '+(p.scene_type||'untagged')+dec;
+  $("lbMeta").textContent=p.w+'×'+p.h+' px';
+  const t=p.tilt_cw||0;
+  $("lbTilt").value=t; $("lbTiltVal").textContent=t.toFixed(1)+'°';
+  $("lbTilt").disabled=!(Array.isArray(p.origin_quad)&&p.origin_quad.length===4);
   $("lightbox").classList.add('open');
 }
+function lbTiltPreview(v){ $("lbTiltVal").textContent=parseFloat(v).toFixed(1)+'°'; }
+async function lbTiltApply(v){
+  if(!lbId)return;
+  setStatus('re-cropping…',true);
+  const ok=await retilt(lbId, v);
+  if(ok){
+    const p=photos.find(x=>x.id===lbId);
+    $("lbImg").src='/api/full/'+lbId+'?r='+p.rotation_cw+'&t='+Date.now();
+    $("lbMeta").textContent=p.w+'×'+p.h+' px';
+    setStatus('tilt applied'); render();
+  }
+}
+function lbTiltReset(){ $("lbTilt").value=0; lbTiltApply(0); }
 function closeLightbox(e,force){
-  // close on backdrop/button/Esc, but not when clicking the image itself
-  if(force || !e || e.target.id==='lightbox' || e.target.tagName==='BUTTON'
-     || e.target.id==='lbImg'){
-    $("lightbox").classList.remove('open'); $("lbImg").src='';
+  // close on backdrop/button/Esc, but not the image or the tilt controls
+  if(force || !e || e.target.id==='lightbox'){
+    $("lightbox").classList.remove('open'); $("lbImg").src=''; lbId=null;
   }
 }
 document.addEventListener('keydown',e=>{
@@ -922,6 +1028,20 @@ async function deleteCrop(id){
   if(r.error){setStatus(r.error);return;}
   photos=r.photos; setStatus('crop deleted'); render();
 }
+async function undupe(id){
+  const r=await api('/api/undupe',{id});
+  if(r.error){setStatus(r.error);return;}
+  const p=photos.find(x=>x.id===id);
+  if(p){ p.is_dup_copy=r.photo.is_dup_copy; p.status=r.photo.status; p.force_keep=true; }
+  setStatus('marked as not a duplicate'); render();
+}
+async function retilt(id, deg){
+  const r=await api('/api/retilt',{id, tilt_cw:parseFloat(deg)});
+  if(r.error){setStatus(r.error);return false;}
+  const p=photos.find(x=>x.id===id);
+  if(p){ p.tilt_cw=r.photo.tilt_cw; p.w=r.photo.w; p.h=r.photo.h; }
+  return true;
+}
 async function doDownload(){
   setStatus('building zip…',true);
   try{
@@ -946,7 +1066,13 @@ function counts(){
   $("nBlank").textContent=photos.filter(p=>p.blank).length;
   $("nDup").textContent=photos.filter(p=>p.is_dup_copy).length;
   $("nKeep").textContent=photos.filter(p=>p.status==='keep').length;
+  const nc=$("navCount"); if(nc) nc.textContent=photos.length;
   renderFiles();
+}
+function gotoReview(){
+  // The crop-review grid IS the main view; bring it into focus.
+  if(!photos.length){ setStatus('no crops yet — use Crop scans first'); return; }
+  document.getElementById('grid').scrollIntoView({behavior:'smooth',block:'start'});
 }
 function renderFiles(){
   // Uploaded scans, each with how many crops came from it.
@@ -990,6 +1116,7 @@ function render(){
         <button onclick="rotate('${p.id}',1)">↻</button>
         <button class="grow" onclick="editDesc('${p.id}')">desc</button>
         <button class="grow" onclick="editTags('${p.id}')">tags</button>
+        ${p.is_dup_copy?`<button onclick="undupe('${p.id}')" title="Not a duplicate — keep it">undup</button>`:''}
         <button onclick="toggleKeep('${p.id}')">${p.status==='keep'?'keep':'skip'}</button>
         <button onclick="deleteCrop('${p.id}')" title="Delete crop">🗑</button>
       </div></div>`;
@@ -1033,45 +1160,45 @@ async function syncShared(){
   }catch(e){}
 }
 // ---- manual crop editor ----
-let ed={i:0, quads:{}, angles:{}, pts:[], img:null, scale:1, drag:null, newbox:null, sel:null};
-// Rotate a box's 4 base (axis-aligned) corners about their centre by deg.
-function rotatedQuad(base, deg){
-  if(!deg) return base.map(p=>[p[0],p[1]]);
-  const cx=(base[0][0]+base[2][0])/2, cy=(base[0][1]+base[2][1])/2;
-  const r=deg*Math.PI/180, cos=Math.cos(r), sin=Math.sin(r);
-  return base.map(([x,y])=>{
-    const dx=x-cx, dy=y-cy;
-    return [cx+dx*cos-dy*sin, cy+dx*sin+dy*cos];
-  });
-}
-// The corners to draw / send for box qi on the current scan (base + tilt).
-function dispQuad(sid, qi){
-  const base=ed.quads[sid][qi];
-  const deg=(ed.angles[sid]&&ed.angles[sid][qi])||0;
-  return rotatedQuad(base, deg);
-}
+// Boxes are axis-aligned rectangles. Tilt/straightening is done later per-crop
+// in the Review view (re-cropped cleanly from the parent scan), not here.
+let ed={i:0, quads:{}, pts:[], img:null, fitScale:1, zoom:1, scale:1,
+        drag:null, newbox:null, sel:null};
+// The corners to draw / send for box qi on the current scan (axis-aligned).
+function dispQuad(sid, qi){ const b=ed.quads[sid][qi]; return b.map(p=>[p[0],p[1]]); }
 const cv=$("cv"), ctx=cv.getContext('2d');
 function openEditor(){
-  if(!scans.length){setStatus('load a folder or drop scans first');return;}
-  ed.i=0; ed.quads={}; ed.angles={}; ed.pts=[]; $("editor").classList.add('open'); loadEScan();
+  if(!scans.length){setStatus('load or drop scans first');return;}
+  ed.i=0; ed.quads={}; ed.pts=[]; ed.zoom=1; $("editor").classList.add('open'); loadEScan();
 }
 function closeEditor(){ $("editor").classList.remove('open'); }
 function curScan(){ return scans[ed.i]; }
 function loadEScan(){
   const s=curScan();
   $("eScanName").textContent=s.name+" ("+(ed.i+1)+"/"+scans.length+")";
-  ed.pts=[]; ed.sel=null; ed.newbox=null; if(!ed.quads[s.id])ed.quads[s.id]=[]; if(!ed.angles[s.id])ed.angles[s.id]=[];
-  if(typeof syncSkewUI==='function') syncSkewUI();
+  ed.pts=[]; ed.sel=null; ed.newbox=null; ed.zoom=1;
+  if(!ed.quads[s.id])ed.quads[s.id]=[];
+  if($("zoom")){ $("zoom").value=1; $("zoomVal").textContent='100%'; }
   ed.img=new Image();
   ed.img.onload=()=>{
     const maxW=Math.min(window.innerWidth-60,1000), maxH=window.innerHeight-170;
-    ed.scale=Math.min(maxW/ed.img.naturalWidth, maxH/ed.img.naturalHeight, 1);
-    cv.width=Math.round(ed.img.naturalWidth*ed.scale);
-    cv.height=Math.round(ed.img.naturalHeight*ed.scale);
-    redraw();
+    ed.fitScale=Math.min(maxW/ed.img.naturalWidth, maxH/ed.img.naturalHeight, 1);
+    applyScale();
   };
   ed.img.src='/api/scan/'+s.id+'?t='+Date.now();
 }
+function applyScale(){
+  ed.scale=ed.fitScale*ed.zoom;
+  cv.width=Math.round(ed.img.naturalWidth*ed.scale);
+  cv.height=Math.round(ed.img.naturalHeight*ed.scale);
+  redraw();
+}
+function onZoom(v){
+  ed.zoom=parseFloat(v); $("zoomVal").textContent=Math.round(ed.zoom*100)+'%';
+  if(ed.img&&ed.img.complete) applyScale();
+}
+function zoomReset(){ ed.zoom=1; if($("zoom"))$("zoom").value=1;
+  $("zoomVal").textContent='100%'; if(ed.img&&ed.img.complete) applyScale(); }
 function eCanvasPos(e){
   const r=cv.getBoundingClientRect();
   return [(e.clientX-r.left)*(cv.width/r.width), (e.clientY-r.top)*(cv.height/r.height)];
@@ -1093,18 +1220,15 @@ cv.addEventListener('pointerdown',e=>{
   const [cx,cy]=eCanvasPos(e); const hit=eFindCorner(cx,cy);
   if(hit){ ed.drag=hit; ed.sel=hit; }
   else { ed.newbox={x0:cx/ed.scale, y0:cy/ed.scale, x1:cx/ed.scale, y1:cy/ed.scale}; ed.sel=null; }
-  syncSkewUI();
   cv.setPointerCapture(e.pointerId);
 });
 cv.addEventListener('pointermove',e=>{
   const [cx,cy]=eCanvasPos(e);
   if(ed.drag){
-    // Rigid rectangle resize: the dragged corner moves to the pointer, the
-    // diagonally-opposite corner stays anchored, and the two neighbours are
-    // recomputed so the box stays axis-aligned. Order is [TL,TR,BR,BL].
-    // Resizing returns the box to axis-aligned (angle reset); apply tilt after.
+    // Rigid rectangle resize: dragged corner moves to the pointer, the
+    // diagonally-opposite corner stays anchored, neighbours recomputed so the
+    // box stays axis-aligned. Order is [TL,TR,BR,BL].
     const sid=curScan().id, q=ed.quads[sid][ed.drag.q];
-    if(ed.angles[sid]) ed.angles[sid][ed.drag.q]=0;
     const i=ed.drag.p, opp=(i+2)%4;
     const ax=q[opp][0], ay=q[opp][1];       // anchored opposite corner
     const nx=cx/ed.scale, ny=cy/ed.scale;    // new dragged corner
@@ -1119,14 +1243,13 @@ cv.addEventListener('pointermove',e=>{
   }
 });
 function ePointerUp(e){
-  if(ed.drag){ ed.drag=null; syncSkewUI(); return; }
+  if(ed.drag){ ed.drag=null; return; }
   if(ed.newbox){
     const b=ed.newbox; ed.newbox=null;
     const x0=Math.min(b.x0,b.x1), x1=Math.max(b.x0,b.x1);
     const y0=Math.min(b.y0,b.y1), y1=Math.max(b.y0,b.y1);
     if((x1-x0)>20 && (y1-y0)>20)
       ed.quads[curScan().id].push([[x0,y0],[x1,y0],[x1,y1],[x0,y1]]);
-      ed.angles[curScan().id].push(0);
     redraw();
   }
 }
@@ -1137,26 +1260,7 @@ function eSelPoint(){
   if(ed.sel.pts) return ed.pts[ed.sel.p];
   const sid=curScan().id, q=ed.quads[sid];
   if(!(q&&q[ed.sel.q])) return null;
-  return dispQuad(sid, ed.sel.q)[ed.sel.p];   // displayed (rotated) position
-}
-// Sync the skew slider to the currently-selected box (enable + show its angle).
-function syncSkewUI(){
-  const s=$("skew"), v=$("skewVal");
-  if(ed.sel && !ed.sel.pts){
-    const sid=curScan().id, a=(ed.angles[sid]&&ed.angles[sid][ed.sel.q])||0;
-    s.disabled=false; s.value=a; v.textContent=a.toFixed(1)+'°';
-  } else {
-    s.disabled=true; s.value=0; v.textContent='0.0°';
-  }
-}
-// Slider moved: set the selected box's tilt and redraw.
-function onSkew(val){
-  if(!ed.sel || ed.sel.pts) return;
-  const sid=curScan().id, a=parseFloat(val);
-  if(!ed.angles[sid]) ed.angles[sid]=[];
-  ed.angles[sid][ed.sel.q]=a;
-  $("skewVal").textContent=a.toFixed(1)+'°';
-  redraw();
+  return dispQuad(sid, ed.sel.q)[ed.sel.p];
 }
 document.addEventListener('keydown',e=>{
   if(!$("editor").classList.contains('open')||!ed.sel)return;
@@ -1228,25 +1332,28 @@ function redraw(){
 }
 function undoPoint(){
   if(ed.pts.length)ed.pts.pop();
-  else{const sid=curScan().id, q=ed.quads[sid];
-       if(q&&q.length){q.pop(); if(ed.angles[sid])ed.angles[sid].pop();}}
+  else{const sid=curScan().id, q=ed.quads[sid]; if(q&&q.length)q.pop();}
   ed.sel=null; redraw();
 }
 function removeLastQuad(){ const sid=curScan().id, q=ed.quads[sid];
-  if(q&&q.length){q.pop(); if(ed.angles[sid])ed.angles[sid].pop();} ed.sel=null; redraw(); }
+  if(q&&q.length)q.pop(); ed.sel=null; redraw(); }
 function prevScan(){ if(ed.i>0){ed.i--; loadEScan();} }
 function nextScan(){ if(ed.i<scans.length-1){ed.i++; loadEScan();} }
 async function cropAll(){
-  setStatus('cropping…',true);
-  let n=0;
-  for(const sid of Object.keys(ed.quads)){
-    const base=ed.quads[sid]; if(!base.length)continue;
-    const quads=base.map((_,qi)=>dispQuad(sid,qi));   // apply per-box tilt
-    const r=await api('/api/crop_manual',{scan_id:sid,quads}); n+=r.added||0;
+  const sids=Object.keys(ed.quads).filter(sid=>ed.quads[sid].length);
+  const total=sids.reduce((a,sid)=>a+ed.quads[sid].length,0);
+  if(!total){ closeEditor(); setStatus('no boxes drawn'); return; }
+  closeEditor();                                  // close first so progress shows
+  setStatus('cropping 0/'+total+'…',true);
+  let n=0, done=0;
+  for(const sid of sids){
+    const quads=ed.quads[sid].map((_,qi)=>dispQuad(sid,qi));
+    const r=await api('/api/crop_manual',{scan_id:sid,quads});
+    n+=r.added||0; done+=quads.length;
+    setStatus('cropping '+done+'/'+total+'…',true);
   }
-  closeEditor();
   const st=await(await fetch('/api/state')).json(); photos=st.photos||[]; render();
-  setStatus('cropped '+n+' photo(s)');
+  setStatus('cropped '+n+' photo(s) — review below');
 }
 init();
 </script>
