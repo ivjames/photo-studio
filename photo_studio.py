@@ -567,6 +567,24 @@ def scan_img(sid):
     return send_file(s["path"], mimetype="image/jpeg") if s else ("", 404)
 
 
+@app.route("/api/scan_thumb/<sid>")
+def scan_thumb(sid):
+    """Downscaled scan thumbnail (longest edge 360px) for the scans list."""
+    s = next((x for x in STATE["scans"] if x["id"] == sid), None)
+    if not s:
+        return "", 404
+    img = cv2.imread(s["path"])
+    if img is None:
+        return "", 404
+    h, w = img.shape[:2]
+    longest = max(h, w)
+    if longest > 360:
+        sc = 360 / longest
+        img = cv2.resize(img, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
+
+
 @app.route("/api/update", methods=["POST"])
 def update():
     j = request.json
@@ -787,6 +805,17 @@ button.primary:hover{filter:brightness(1.08)}
   font-size:10px;margin:2px 0 4px}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
+.slgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;width:100%}
+.scard{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  overflow:hidden;cursor:pointer;transition:.15s;position:relative}
+.scard:hover{border-color:var(--accent)}
+.scard .sthumb{aspect-ratio:4/3;background:#0d0c09;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.scard .sthumb img{max-width:100%;max-height:100%;object-fit:contain}
+.scard .sname{padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px;color:var(--mut);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scard .scount{position:absolute;top:8px;right:8px;font-family:ui-monospace,monospace;font-size:11px;
+  padding:3px 8px;border-radius:20px;background:rgba(0,0,0,.6);border:1px solid var(--line);color:var(--mut)}
+.scard .scount.has{background:var(--accent2);color:#16210f;border:0;font-weight:600}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
   overflow:hidden;display:flex;flex-direction:column;transition:.15s}
 .card:hover{border-color:#5a5340}
@@ -895,6 +924,14 @@ button.primary:hover{filter:brightness(1.08)}
   <div id="grid" class="grid"></div>
   <div id="empty" class="empty">Load or drop scans, then use <b>Manual crop</b> to draw boxes around each photo.</div>
 </main>
+</div>
+<div class="modal" id="scansList">
+  <div class="ehead">
+    <h2>Scans <span class="einfo" id="slCount"></span></h2>
+    <span class="einfo">Click a scan to crop it. The badge shows how many photos you've cropped from it.</span>
+    <button style="margin-left:auto" onclick="closeScansList()">Close</button>
+  </div>
+  <div class="ebody" style="align-items:flex-start"><div id="slGrid" class="slgrid"></div></div>
 </div>
 <div class="modal" id="editor">
   <div class="ehead">
@@ -1167,11 +1204,33 @@ let ed={i:0, quads:{}, pts:[], img:null, fitScale:1, zoom:1, scale:1,
 // The corners to draw / send for box qi on the current scan (axis-aligned).
 function dispQuad(sid, qi){ const b=ed.quads[sid][qi]; return b.map(p=>[p[0],p[1]]); }
 const cv=$("cv"), ctx=cv.getContext('2d');
-function openEditor(){
+function openScansList(){
   if(!scans.length){setStatus('load or drop scans first');return;}
-  ed.i=0; ed.quads={}; ed.pts=[]; ed.zoom=1; $("editor").classList.add('open'); loadEScan();
+  renderScansList();
+  $("scansList").classList.add('open');
 }
-function closeEditor(){ $("editor").classList.remove('open'); }
+function closeScansList(){ $("scansList").classList.remove('open'); }
+function renderScansList(){
+  $("slCount").textContent='('+scans.length+')';
+  $("slGrid").innerHTML=scans.map((s,idx)=>{
+    const n=photos.filter(p=>p.scan_id===s.id).length;
+    const badge=`<span class="scount${n?' has':''}">${n} crop${n!==1?'s':''}</span>`;
+    return `<div class="scard" onclick="openEditorAt(${idx})">
+      <div class="sthumb"><img src="/api/scan_thumb/${s.id}" loading="lazy"></div>
+      <div class="sname">${s.name}</div>${badge}</div>`;
+  }).join('');
+}
+function openEditor(){ openScansList(); }   // entry point -> scans list first
+function openEditorAt(idx){
+  closeScansList();
+  ed.i=idx; ed.quads={}; ed.pts=[]; ed.zoom=1;
+  $("editor").classList.add('open'); loadEScan();
+}
+function closeEditor(){
+  $("editor").classList.remove('open');
+  // back to the scans list so counts reflect any crops just made
+  if(scans.length){ renderScansList(); $("scansList").classList.add('open'); }
+}
 function curScan(){ return scans[ed.i]; }
 function loadEScan(){
   const s=curScan();
@@ -1353,6 +1412,7 @@ async function cropAll(){
     setStatus('cropping '+done+'/'+total+'…',true);
   }
   const st=await(await fetch('/api/state')).json(); photos=st.photos||[]; render();
+  if($("scansList").classList.contains('open')) renderScansList();
   setStatus('cropped '+n+' photo(s) — review below');
 }
 init();
