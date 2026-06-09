@@ -1,0 +1,62 @@
+# DigitalOcean App Platform spec for Photo Studio.
+# Apply: console → app → Settings → "App Spec" → Edit/paste, OR
+#        doctl apps update <APP_ID> --spec .do/app.yaml
+# Create: doctl apps create --spec .do/app.yaml
+#
+# Before applying, replace the two REPLACE_ME secrets and the domain below.
+
+name: photo-studio
+region: nyc                          # change to your region (e.g. sfo3, fra1, ams3)
+
+services:
+  - name: web
+    dockerfile_path: Dockerfile
+    github:
+      repo: ivjames/photo-studio
+      branch: main
+      deploy_on_push: true
+
+    # App Platform injects PORT = http_port and routes TLS-terminated traffic here.
+    # The Dockerfile binds 0.0.0.0:$PORT, so this just needs to match.
+    http_port: 8080
+
+    # Keep at 1. State is an in-memory STATE dict + on-disk /data; it is NOT
+    # shared across instances, and gunicorn runs -w 1 by design. Scaling
+    # horizontally would give each instance a divergent session.
+    instance_count: 1
+
+    # 512 MB (basic-xxs) is tight for OpenCV processing full-page scans.
+    # Confirm/adjust in the console — slug names change over time.
+    instance_size_slug: basic-xs     # 1 vCPU / 1 GB
+
+    health_check:
+      http_path: /
+      initial_delay_seconds: 20
+
+    envs:
+      # --- Auth (REQUIRED on a public URL; without it the app is open) ---
+      - key: PHOTOSTUDIO_USER
+        scope: RUN_TIME
+        value: admin
+      - key: PHOTOSTUDIO_PASSWORD
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_ME           # set a long random password
+
+      # --- Vision tagging (optional; can also be entered in the UI) ---
+      - key: ANTHROPIC_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_ME           # sk-ant-...  (or delete this env entirely)
+
+      # Data dir. NOTE: App Platform's filesystem is EPHEMERAL — anything under
+      # /data is wiped on every deploy/restart. Treat sessions as disposable;
+      # have users download finished photos.
+      - key: PHOTOSTUDIO_HOME
+        scope: RUN_TIME
+        value: /data
+
+domains:
+  - domain: photos.example.com       # replace with your subdomain
+    type: PRIMARY
+    zone: example.com                # the parent zone hosted in DO DNS
