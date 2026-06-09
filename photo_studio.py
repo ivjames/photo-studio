@@ -27,6 +27,7 @@ import json
 import os
 import tempfile
 import threading
+import zipfile
 import urllib.request
 import urllib.error
 import uuid
@@ -35,7 +36,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response, after_this_request
 
 # Reuse the validated CV logic from the two pipeline scripts.
 from scan_splitter import estimate_background, build_foreground_mask, crop_rotated
@@ -51,7 +52,7 @@ WORK.mkdir(parents=True, exist_ok=True)
 SESSION_FILE = WORK / "session.json"
 STATE = {"scans": [], "photos": [], "rev": 0}  # shared workspace, persisted to disk
 SAVE_LOCK = threading.Lock()
-DEFAULT_MODEL = "claude-sonnet-4-6"   # confirm current id at docs.claude.com
+DEFAULT_MODEL = "claude-sonnet-4-5"   # confirm current id at docs.claude.com
 
 # --- deployment config (env vars; sane local defaults) ---------------------
 TAGGER = os.environ.get("PHOTOSTUDIO_TAGGER", "anthropic").lower()  # "anthropic" | "ollama"
@@ -303,9 +304,7 @@ def rev():
 
 @app.route("/api/config")
 def config():
-    return jsonify({"tagger": TAGGER, "ollama_model": OLLAMA_MODEL,
-                    "ollama_url": OLLAMA_URL if TAGGER == "ollama" else None,
-                    "user": current_user(), "multiuser": bool(USERS)})
+    return jsonify({"user": current_user(), "multiuser": bool(USERS)})
 
 
 @app.route("/api/clear", methods=["POST"])
@@ -440,11 +439,29 @@ def crop_manual():
 
 @app.route("/api/thumb/<pid>")
 def thumb(pid):
+    """Downscaled image for the grid (longest edge 480px) — fast to scroll."""
     p = next((x for x in STATE["photos"] if x["id"] == pid), None)
     if not p:
         return "", 404
     img = apply_rotation(cv2.imread(p["path"]), p["rotation_cw"])
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    h, w = img.shape[:2]
+    longest = max(h, w)
+    if longest > 320:
+        s = 320 / longest
+        img = cv2.resize(img, (int(w * s), int(h * s)),
+                         interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
+
+
+@app.route("/api/full/<pid>")
+def full(pid):
+    """Full-resolution image (rotation applied) for the lightbox view."""
+    p = next((x for x in STATE["photos"] if x["id"] == pid), None)
+    if not p:
+        return "", 404
+    img = apply_rotation(cv2.imread(p["path"]), p["rotation_cw"])
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 98])
     return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
 
 
@@ -544,6 +561,75 @@ def export():
     return jsonify({"exported": n, "total": len(rows), "out_dir": str(out)})
 
 
+@app.route("/api/download", methods=["POST"])
+def download():
+    """Build the same export (corrected/ + blank/ + manifests) as a zip and
+    stream it to the browser. No server path needed — for remote deployments
+    where the user can't reach the server filesystem.
+
+    The zip is written to a temp file (not held in memory) so peak memory stays
+    near one image at a time, matching /api/export's footprint."""
+    photos = STATE["photos"]
+    if not photos:
+        return jsonify({"error": "Nothing to download — no photos."}), 400
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    rows, n = [], 0
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in photos:
+                img = cv2.imread(p["path"])
+                if img is None:
+                    continue
+                if p["blank"] or p["status"] == "skip":
+                    arc = f"blank/{p['scan_name']}_{p['id']}.jpg"
+                    ok, buf = cv2.imencode(".jpg", img,
+                                           [cv2.IMWRITE_JPEG_QUALITY, 92])
+                else:
+                    corrected = apply_rotation(img, p["rotation_cw"])
+                    arc = (f"corrected/{Path(p['scan_name']).stem}"
+                           f"_{p['index']:02d}_{p['id']}.jpg")
+                    ok, buf = cv2.imencode(".jpg", corrected,
+                                           [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    n += 1
+                if ok:
+                    zf.writestr(arc, buf.tobytes())
+                rows.append({k: p.get(k) for k in (
+                    "scan_name", "index", "id", "status", "blank", "dup_group",
+                    "is_dup_copy", "rotation_cw", "scene_type", "people_count",
+                    "decade", "decade_confidence", "description", "tags")})
+            zf.writestr("manifest.json",
+                        json.dumps(rows, indent=2, default=str))
+            keys = list(rows[0].keys()) if rows else []
+            sio = io.StringIO()
+            w = csv.DictWriter(sio, fieldnames=keys)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: (json.dumps(r[k]) if isinstance(r[k], list)
+                                else r[k]) for k in keys})
+            zf.writestr("manifest.csv", sio.getvalue())
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    # Stream the file, then delete it once the response is fully sent.
+    @after_this_request
+    def _cleanup(resp):
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return resp
+
+    return send_file(tmp_path, mimetype="application/zip",
+                     as_attachment=True, download_name="photo_studio_export.zip")
+
+
 # --------------------------------------------------------------------------- #
 # Frontend (single page, vanilla JS — no build step)
 # --------------------------------------------------------------------------- #
@@ -601,7 +687,15 @@ button.primary:hover{filter:brightness(1.08)}
 .card.skip{opacity:.45}
 .thumbwrap{position:relative;aspect-ratio:4/3;background:#0d0c09;display:flex;
   align-items:center;justify-content:center;overflow:hidden}
-.thumbwrap img{max-width:100%;max-height:100%;object-fit:contain}
+.thumbwrap img{max-width:100%;max-height:100%;object-fit:contain;cursor:zoom-in}
+.lightbox{position:fixed;inset:0;background:rgba(8,7,5,.92);z-index:60;display:none;
+  flex-direction:column;padding:14px 18px}
+.lightbox.open{display:flex}
+.lbhead{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.lbhead h2{font-size:15px;margin:0;font-family:ui-monospace,monospace;color:var(--ink)}
+.lbbody{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;min-height:0}
+.lbbody img{max-width:100%;max-height:100%;object-fit:contain;cursor:zoom-out}
+.lbmeta{font-size:12px;color:var(--mut);font-family:ui-monospace,monospace}
 .badges{position:absolute;top:6px;left:6px;display:flex;gap:4px;flex-wrap:wrap}
 .badge{font-family:ui-monospace,monospace;font-size:10px;padding:2px 6px;border-radius:5px;
   background:rgba(0,0,0,.6);color:var(--ink);border:1px solid var(--line)}
@@ -664,19 +758,13 @@ button.primary:hover{filter:brightness(1.08)}
     <button class="primary" style="width:100%;margin-top:12px" onclick="detect()">Detect photos</button>
   </div>
   <div class="group">
-    <h3>3 · Auto-tag <span id="taggerName" class="einfo"></span></h3>
-    <label>API key — only for Anthropic (kept in this tab)</label>
-    <input type="password" id="key" placeholder="sk-… (ignored for Ollama)">
-    <label>Model (optional override)</label>
-    <input type="text" id="model" placeholder="auto">
-    <button style="width:100%;margin-top:10px" onclick="tagAll()">Tag kept photos</button>
-    <div class="note">Tags, decade, description &amp; orientation. Blanks and duplicate copies are skipped. Provider is set on the server (Anthropic or Ollama).</div>
-  </div>
-  <div class="group">
-    <h3>4 · Export</h3>
-    <label>Output folder (local path)</label>
-    <input type="text" id="outdir" placeholder="/Users/me/sorted">
-    <button class="primary" style="width:100%;margin-top:10px" onclick="doExport()">Export + manifest</button>
+    <h3>3 · Export</h3>
+    <button class="primary" style="width:100%" onclick="doDownload()">Download .zip</button>
+    <div class="note">Downloads corrected photos, blanks, and manifests to your computer. Works anywhere, including remote servers.</div>
+    <label style="margin-top:14px">Or save to a folder on the server</label>
+    <input type="text" id="outdir" placeholder="/path/on/server">
+    <button style="width:100%;margin-top:8px" onclick="doExport()">Save to server folder</button>
+    <div class="note">Writes to a path on the machine running the app — useful only for local runs.</div>
   </div>
   <div class="group">
     <h3>Summary</h3>
@@ -711,10 +799,36 @@ button.primary:hover{filter:brightness(1.08)}
     <button class="primary" style="margin-left:auto" onclick="cropAll()">Crop all &amp; close</button>
   </div>
 </div>
+<div class="lightbox" id="lightbox" onclick="closeLightbox(event)">
+  <div class="lbhead">
+    <h2 id="lbName"></h2>
+    <span class="lbmeta" id="lbMeta"></span>
+    <button style="margin-left:auto" onclick="closeLightbox(event,true)">Close ✕</button>
+  </div>
+  <div class="lbbody"><img id="lbImg" src="" alt=""></div>
+</div>
 <script>
 let photos=[], scans=[];
 const $=id=>document.getElementById(id);
 function setStatus(t,busy){ $("status").innerHTML = busy?'<span class="spin"></span> '+t : t; }
+function openLightbox(id){
+  const p=photos.find(x=>x.id===id); if(!p)return;
+  $("lbImg").src='/api/full/'+p.id+'?r='+p.rotation_cw;
+  $("lbName").textContent=p.scan_name+' · #'+p.index;
+  const dec=p.decade?(' · '+p.decade):'';
+  $("lbMeta").textContent=p.w+'×'+p.h+' px · '+(p.scene_type||'untagged')+dec;
+  $("lightbox").classList.add('open');
+}
+function closeLightbox(e,force){
+  // close on backdrop/button/Esc, but not when clicking the image itself
+  if(force || !e || e.target.id==='lightbox' || e.target.tagName==='BUTTON'
+     || e.target.id==='lbImg'){
+    $("lightbox").classList.remove('open'); $("lbImg").src='';
+  }
+}
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape' && $("lightbox").classList.contains('open')) closeLightbox(null,true);
+});
 async function api(url,body){
   const o={method:'POST',headers:{'Content-Type':'application/json'}};
   if(body)o.body=JSON.stringify(body);
@@ -736,15 +850,6 @@ async function detect(){
   const r=await api('/api/detect',detectParams());
   photos=r.photos; setStatus(photos.length+' photo(s) found'); render();
 }
-async function tagAll(){
-  const keep=photos.filter(p=>p.status==='keep'&&!p.blank);
-  if(!keep.length){setStatus('nothing to tag');return;}
-  setStatus('tagging '+keep.length+'…',true);
-  const r=await api('/api/tag',{api_key:$("key").value,model:$("model").value});
-  if(r.error){setStatus(r.error);return;}
-  photos=r.photos; const errs=r.results.filter(x=>x.error).length;
-  setStatus('tagged'+(errs?(' ('+errs+' error)'):'')); render();
-}
 async function rotate(id,dir){
   const p=photos.find(x=>x.id===id); p.rotation_cw=((p.rotation_cw+dir*90)%360+360)%360;
   await api('/api/update',{id,rotation_cw:p.rotation_cw}); render();
@@ -763,6 +868,25 @@ async function doExport(){
   const r=await api('/api/export',{out_dir:$("outdir").value});
   if(r.error){setStatus(r.error);return;}
   setStatus('exported '+r.exported+' photo(s) → '+r.out_dir);
+}
+async function doDownload(){
+  setStatus('building zip…',true);
+  try{
+    const resp=await fetch('/api/download',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'});
+    if(!resp.ok){
+      let msg='download failed';
+      try{ msg=(await resp.json()).error||msg; }catch(e){}
+      setStatus(msg); return;
+    }
+    const blob=await resp.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='photo_studio_export.zip';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    setStatus('downloaded photo_studio_export.zip');
+  }catch(e){ setStatus('download error: '+e); }
 }
 function counts(){
   $("nPhotos").textContent=photos.length;
@@ -784,7 +908,7 @@ function render(){
     const dec=p.decade?`${p.decade}${p.decade_confidence?' ('+p.decade_confidence[0]+')':''}`:'';
     const ppl=(p.people_count!=null)?`${p.people_count}p`:'';
     return `<div class="card ${p.status==='skip'?'skip':''}">
-      <div class="thumbwrap"><img src="/api/thumb/${p.id}?r=${p.rotation_cw}" loading="lazy">
+      <div class="thumbwrap"><img src="/api/thumb/${p.id}?r=${p.rotation_cw}" loading="lazy" onclick="openLightbox('${p.id}')">
         <div class="badges">${badges}</div></div>
       <div class="cardbody">
         <div class="nm">${p.scan_name} · #${p.index}</div>
@@ -825,8 +949,6 @@ async function init(){
   }catch(e){}
   try{
     const c=await(await fetch('/api/config')).json();
-    $("taggerName").textContent = c.tagger==='ollama' ? '· Ollama ('+c.ollama_model+')' : '· Claude';
-    if(c.tagger==='ollama'){ $("key").style.display='none'; $("key").previousElementSibling.style.display='none'; }
     if(c.multiuser){ $("status").textContent='signed in as '+c.user; }
   }catch(e){}
   setInterval(syncShared, 5000);   // shared workspace: pick up others' changes
@@ -887,7 +1009,17 @@ cv.addEventListener('pointerdown',e=>{
 cv.addEventListener('pointermove',e=>{
   const [cx,cy]=eCanvasPos(e);
   if(ed.drag){
-    ed.quads[curScan().id][ed.drag.q][ed.drag.p]=[cx/ed.scale, cy/ed.scale]; redraw();
+    // Rigid rectangle resize: the dragged corner moves to the pointer, the
+    // diagonally-opposite corner stays anchored, and the two neighbours are
+    // recomputed so the box stays axis-aligned. Order is [TL,TR,BR,BL].
+    const q=ed.quads[curScan().id][ed.drag.q];
+    const i=ed.drag.p, opp=(i+2)%4;
+    const ax=q[opp][0], ay=q[opp][1];       // anchored opposite corner
+    const nx=cx/ed.scale, ny=cy/ed.scale;    // new dragged corner
+    const x0=Math.min(ax,nx), x1=Math.max(ax,nx);
+    const y0=Math.min(ay,ny), y1=Math.max(ay,ny);
+    q[0]=[x0,y0]; q[1]=[x1,y0]; q[2]=[x1,y1]; q[3]=[x0,y1];
+    redraw();
   } else if(ed.newbox){
     ed.newbox.x1=cx/ed.scale; ed.newbox.y1=cy/ed.scale; redraw();
   } else {
