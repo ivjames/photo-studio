@@ -1093,7 +1093,7 @@ button.primary:hover{filter:brightness(1.08)}
       <b id="selCount">0</b> selected
       <button onclick="bulkFolder('add')">＋ folder</button>
       <button onclick="bulkFolder('remove')">－ folder</button>
-      <button onclick="bulkMeta()">desc/tags</button>
+      <button onclick="bulkMeta()" title="Edit description &amp; tags">📝</button>
       <button onclick="bulkDownload()">⬇ zip</button>
       <button class="danger" onclick="bulkDelete()">🗑 delete</button>
       <button onclick="clearSel()">clear</button>
@@ -1466,7 +1466,7 @@ function render(){
       <div class="cardctl">
         <button onclick="rotate('${p.id}',-1)" title="Rotate left">↺</button>
         <button onclick="rotate('${p.id}',1)" title="Rotate right">↻</button>
-        <button class="grow" onclick="openMeta('${p.id}')">Description &amp; tags</button>
+        <button class="grow" onclick="openMeta('${p.id}')" title="Edit description &amp; tags">📝</button>
         <button onclick="downloadCrop('${p.id}')" title="Download this crop">⬇</button>
         <button onclick="deleteCrop('${p.id}')" title="Delete crop">🗑</button>
       </div></div>`;
