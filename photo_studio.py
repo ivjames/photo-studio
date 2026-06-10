@@ -42,7 +42,6 @@ from flask import Flask, request, jsonify, send_file, Response, after_this_reque
 # Reuse the validated CV logic from the two pipeline scripts.
 from scan_splitter import estimate_background, build_foreground_mask, crop_rotated
 from photo_tagger import (
-    blankness, dhash, group_duplicates, face_orientation_hint,
     encode_image, parse_json, VISION_PROMPT, apply_rotation, IMAGE_EXTS,
 )
 
@@ -51,7 +50,7 @@ app = Flask(__name__)
 WORK = Path(os.environ.get("PHOTOSTUDIO_HOME", Path.home() / ".photostudio"))
 WORK.mkdir(parents=True, exist_ok=True)
 SESSION_FILE = WORK / "session.json"
-STATE = {"scans": [], "photos": [], "rev": 0}  # shared workspace, persisted to disk
+STATE = {"scans": [], "photos": [], "folders": [], "rev": 0}  # shared workspace, persisted to disk
 SAVE_LOCK = threading.Lock()
 DEFAULT_MODEL = "claude-sonnet-4-5"   # confirm current id at docs.claude.com
 
@@ -120,8 +119,11 @@ def load_session():
         data = json.loads(SESSION_FILE.read_text())
         STATE["scans"] = [s for s in data.get("scans", []) if Path(s["path"]).exists()]
         STATE["photos"] = [p for p in data.get("photos", []) if Path(p["path"]).exists()]
+        STATE["folders"] = data.get("folders", [])
+        for p in STATE["photos"]:
+            p.setdefault("folders", [])     # backfill for pre-folders crops
         print(f"  restored session: {len(STATE['scans'])} scan(s), "
-              f"{len(STATE['photos'])} photo(s)")
+              f"{len(STATE['photos'])} photo(s), {len(STATE['folders'])} folder(s)")
     except Exception as e:  # noqa: BLE001
         print("  ! could not load session:", e)
 
@@ -158,6 +160,34 @@ def detect_photos(img, sensitivity, min_area_frac, max_area_frac, pad, deskew):
     return out
 
 
+THUMB_MAX = 480   # longest edge for cached crop thumbnails
+SCAN_THUMB_MAX = 480
+
+
+def _thumb_path(img_path):
+    p = Path(img_path)
+    return p.with_name(p.stem + "_thumb.jpg")
+
+
+def make_thumb(img_path, max_dim=THUMB_MAX, quality=78):
+    """Pre-generate and cache a downscaled thumbnail next to the image, so the
+    UI never has to resize on the fly (fast over slow connections)."""
+    try:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        longest = max(h, w)
+        if longest > max_dim:
+            s = max_dim / longest
+            img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+        tp = _thumb_path(img_path)
+        cv2.imwrite(str(tp), img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return tp
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def register_scan(path):
     img = cv2.imread(str(path))
     if img is None:
@@ -165,6 +195,7 @@ def register_scan(path):
     sid = uuid.uuid4().hex[:8]
     dst = WORK / f"scan_{sid}.jpg"
     cv2.imwrite(str(dst), img)
+    make_thumb(dst, SCAN_THUMB_MAX)         # cache scan thumb up front
     STATE["scans"].append({"id": sid, "name": Path(path).name,
                            "path": str(dst), "w": img.shape[1], "h": img.shape[0]})
     return sid
@@ -172,7 +203,6 @@ def register_scan(path):
 
 def run_detection(params):
     STATE["photos"] = []
-    grays = []
     for scan in STATE["scans"]:
         img = cv2.imread(scan["path"])
         found = detect_photos(
@@ -187,9 +217,7 @@ def run_detection(params):
             pid = uuid.uuid4().hex[:8]
             cpath = WORK / f"crop_{pid}.jpg"
             cv2.imwrite(str(cpath), crop)
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            is_blank, std, edge = blankness(gray)
-            grays.append((pid, gray))
+            make_thumb(cpath)
             bx, by, bw, bh = bbox
             STATE["photos"].append({
                 "id": pid, "scan_id": scan["id"], "scan_name": scan["name"],
@@ -197,35 +225,10 @@ def run_detection(params):
                 "origin_quad": [[float(bx), float(by)], [float(bx + bw), float(by)],
                                 [float(bx + bw), float(by + bh)], [float(bx), float(by + bh)]],
                 "w": crop.shape[1], "h": crop.shape[0],
-                "blank": bool(is_blank), "std": round(std, 1),
-                "rotation_cw": 0, "tilt_cw": 0, "dup_group": None, "is_dup_copy": False,
-                "face_hint_cw": None,
-                "status": "skip" if is_blank else "keep",
-                "tags": [], "description": "", "scene_type": "",
-                "people_count": None, "decade": "", "decade_confidence": "",
+                "rotation_cw": 0, "tilt_cw": 0,
+                "tags": [], "description": "", "folders": [],
                 "added_by": current_user(),
             })
-    # duplicates across everything
-    if grays:
-        hashes = [dhash(g) for _, g in grays]
-        groups = group_duplicates(hashes, params["dup_dist"])
-        seen = set()
-        gid_by_pid = {}
-        for (pid, _), g in zip(grays, groups):
-            gid_by_pid[pid] = g
-        for p in STATE["photos"]:
-            g = gid_by_pid[p["id"]]
-            p["dup_group"] = int(g)
-            p["is_dup_copy"] = g in seen
-            seen.add(g)
-            if p["is_dup_copy"] and p["status"] == "keep":
-                p["status"] = "skip"
-        # offline orientation hint for keepers
-        gray_by_pid = dict(grays)
-        for p in STATE["photos"]:
-            if not p["blank"] and not p["is_dup_copy"]:
-                # Stored for reference/Claude; not auto-applied (unreliable on real photos).
-                p["face_hint_cw"] = face_orientation_hint(gray_by_pid[p["id"]])
     return STATE["photos"]
 
 
@@ -298,6 +301,7 @@ def index():
 @app.route("/api/state")
 def state():
     return jsonify({"scans": STATE["scans"], "photos": STATE["photos"],
+                    "folders": STATE.get("folders", []),
                     "rev": STATE.get("rev", 0)})
 
 
@@ -311,10 +315,56 @@ def config():
     return jsonify({"user": current_user(), "multiuser": bool(USERS)})
 
 
+@app.route("/api/folder_create", methods=["POST"])
+def folder_create():
+    name = (request.json or {}).get("name", "").strip()
+    if not name:
+        return jsonify({"error": "empty name"}), 400
+    if name in STATE["folders"]:
+        return jsonify({"error": "folder exists"}), 400
+    STATE["folders"].append(name)
+    save_session()
+    return jsonify({"ok": True, "folders": STATE["folders"]})
+
+
+@app.route("/api/folder_delete", methods=["POST"])
+def folder_delete():
+    """Delete a folder: remove it from the list and strip the label from every
+    crop. Crops themselves are untouched."""
+    name = (request.json or {}).get("name", "")
+    STATE["folders"] = [f for f in STATE["folders"] if f != name]
+    for p in STATE["photos"]:
+        if name in p.get("folders", []):
+            p["folders"] = [f for f in p["folders"] if f != name]
+    save_session()
+    return jsonify({"ok": True, "folders": STATE["folders"], "photos": STATE["photos"]})
+
+
+@app.route("/api/folder_assign", methods=["POST"])
+def folder_assign():
+    """Add or remove a folder label on a crop. action: 'add' | 'remove'."""
+    j = request.json or {}
+    pid, name = j.get("id"), j.get("name", "")
+    action = j.get("action", "add")
+    p = next((x for x in STATE["photos"] if x["id"] == pid), None)
+    if not p:
+        return jsonify({"error": "not found"}), 404
+    if name not in STATE["folders"]:
+        return jsonify({"error": "no such folder"}), 400
+    folders = p.setdefault("folders", [])
+    if action == "add" and name not in folders:
+        folders.append(name)
+    elif action == "remove" and name in folders:
+        p["folders"] = [f for f in folders if f != name]
+    save_session()
+    return jsonify({"ok": True, "photo": p})
+
+
 @app.route("/api/clear", methods=["POST"])
 def clear():
     STATE["scans"] = []
     STATE["photos"] = []
+    STATE["folders"] = []
     for pat in ("crop_*.jpg", "scan_*.jpg", "upload_*"):
         for f in WORK.glob(pat):
             try:
@@ -364,24 +414,6 @@ def detect():
     return jsonify({"photos": photos})
 
 
-def recompute_duplicates(dup_dist=10):
-    photos = STATE["photos"]
-    if not photos:
-        return
-    hashes = [dhash(cv2.cvtColor(cv2.imread(p["path"]), cv2.COLOR_BGR2GRAY)) for p in photos]
-    groups = group_duplicates(hashes, dup_dist)
-    seen = set()
-    for p, gp in zip(photos, groups):
-        p["dup_group"] = int(gp)
-        if p.get("force_keep"):
-            # User marked this as NOT a duplicate — never auto-flag it, and
-            # don't let it claim the group's "original" slot.
-            p["is_dup_copy"] = False
-            continue
-        p["is_dup_copy"] = gp in seen
-        seen.add(gp)
-
-
 def order_quad(pts):
     """Order 4 points as TL, TR, BR, BL regardless of click order."""
     pts = np.array(pts, dtype=np.float32)
@@ -424,44 +456,94 @@ def crop_manual():
         pid = uuid.uuid4().hex[:8]
         cpath = WORK / f"crop_{pid}.jpg"
         cv2.imwrite(str(cpath), crop)
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        is_blank, std, _ = blankness(gray)
-        # Face hint is stored for reference/Claude but NOT auto-applied (unreliable
-        # on faded, angled prints); the user sets final rotation in the grid.
-        hint = None if is_blank else face_orientation_hint(gray)
+        make_thumb(cpath)
         STATE["photos"].append({
             "id": pid, "scan_id": sid, "scan_name": scan["name"],
             "index": base + k, "path": str(cpath), "bbox": None,
             "origin_quad": [[float(x), float(y)] for x, y in quad],
             "w": crop.shape[1], "h": crop.shape[0],
-            "blank": bool(is_blank), "std": round(std, 1),
-            "rotation_cw": 0, "tilt_cw": 0, "dup_group": None, "is_dup_copy": False,
-            "face_hint_cw": hint, "status": "skip" if is_blank else "keep",
-            "tags": [], "description": "", "scene_type": "",
-            "people_count": None, "decade": "", "decade_confidence": "",
+            "rotation_cw": 0, "tilt_cw": 0,
+            "tags": [], "description": "", "folders": [],
             "added_by": current_user(),
         })
         added += 1
-    recompute_duplicates()
     save_session()
     return jsonify({"photos": STATE["photos"], "added": added})
 
 
+@app.route("/api/delete_crops", methods=["POST"])
+def delete_crops():
+    """Delete multiple crops in one call."""
+    ids = set((request.json or {}).get("ids", []))
+    if not ids:
+        return jsonify({"error": "no ids"}), 400
+    removed = 0
+    for p in [x for x in STATE["photos"] if x["id"] in ids]:
+        for fp in (Path(p["path"]), _thumb_path(p["path"])):
+            try:
+                fp.unlink()
+            except OSError:
+                pass
+        removed += 1
+    STATE["photos"] = [x for x in STATE["photos"] if x["id"] not in ids]
+    save_session()
+    return jsonify({"ok": True, "removed": removed, "photos": STATE["photos"]})
+
+
+@app.route("/api/folder_assign_bulk", methods=["POST"])
+def folder_assign_bulk():
+    """Add or remove a folder label on many crops at once."""
+    j = request.json or {}
+    ids = set(j.get("ids", []))
+    name = j.get("name", "")
+    action = j.get("action", "add")
+    if name not in STATE["folders"]:
+        return jsonify({"error": "no such folder"}), 400
+    for p in STATE["photos"]:
+        if p["id"] not in ids:
+            continue
+        folders = p.setdefault("folders", [])
+        if action == "add" and name not in folders:
+            folders.append(name)
+        elif action == "remove" and name in folders:
+            p["folders"] = [f for f in folders if f != name]
+    save_session()
+    return jsonify({"ok": True, "photos": STATE["photos"]})
+
+
+@app.route("/api/update_bulk", methods=["POST"])
+def update_bulk():
+    """Set description and/or tags on many crops at once."""
+    j = request.json or {}
+    ids = set(j.get("ids", []))
+    for p in STATE["photos"]:
+        if p["id"] not in ids:
+            continue
+        if "description" in j:
+            p["description"] = j["description"]
+        if "tags" in j:
+            p["tags"] = ([t.strip() for t in j["tags"] if t.strip()]
+                         if isinstance(j["tags"], list)
+                         else [t.strip() for t in str(j["tags"]).split(",") if t.strip()])
+    save_session()
+    return jsonify({"ok": True, "photos": STATE["photos"]})
+
+
 @app.route("/api/delete_crop", methods=["POST"])
 def delete_crop():
-    """Delete a single crop: remove it from state, delete its file, and
-    recompute duplicates. Its dimmed region on the parent scan clears because
-    the editor derives dimming live from the remaining crops' origin_quads."""
+    """Delete a single crop: remove it from state and delete its files. Its
+    dimmed region on the parent scan clears because the editor derives dimming
+    live from the remaining crops' origin_quads."""
     pid = (request.json or {}).get("id")
     p = next((x for x in STATE["photos"] if x["id"] == pid), None)
     if not p:
         return jsonify({"error": "not found"}), 404
-    try:
-        Path(p["path"]).unlink()
-    except OSError:
-        pass
+    for fp in (Path(p["path"]), _thumb_path(p["path"])):
+        try:
+            fp.unlink()
+        except OSError:
+            pass
     STATE["photos"] = [x for x in STATE["photos"] if x["id"] != pid]
-    recompute_duplicates()
     save_session()
     return jsonify({"ok": True, "photos": STATE["photos"]})
 
@@ -480,23 +562,6 @@ def _rotate_quad(quad, deg):
         dx, dy = x - cx, y - cy
         out.append([cx + dx * cos - dy * sin, cy + dx * sin + dy * cos])
     return out
-
-
-@app.route("/api/undupe", methods=["POST"])
-def undupe():
-    """Mark a photo as NOT a duplicate (for highly-similar-but-different shots
-    the hash grouped together). Sets force_keep so dedup won't re-flag it, and
-    restores it to 'keep' if it had been auto-skipped as a dup copy."""
-    pid = (request.json or {}).get("id")
-    p = next((x for x in STATE["photos"] if x["id"] == pid), None)
-    if not p:
-        return jsonify({"error": "not found"}), 404
-    p["force_keep"] = True
-    p["is_dup_copy"] = False
-    if p["status"] == "skip" and not p["blank"]:
-        p["status"] = "keep"
-    save_session()
-    return jsonify({"ok": True, "photo": p})
 
 
 @app.route("/api/retilt", methods=["POST"])
@@ -527,6 +592,7 @@ def retilt():
     if crop is None or crop.size == 0:
         return jsonify({"error": "re-crop produced empty image"}), 400
     cv2.imwrite(p["path"], crop)            # overwrite in place (same id/path)
+    make_thumb(p["path"])                   # refresh cached thumbnail
     p["tilt_cw"] = deg
     p["w"], p["h"] = crop.shape[1], crop.shape[0]
     save_session()
@@ -535,29 +601,39 @@ def retilt():
 
 @app.route("/api/thumb/<pid>")
 def thumb(pid):
-    """Downscaled image for the grid (longest edge 480px) — fast to scroll."""
+    """Serve the pre-generated cached thumbnail (fast over slow links). If the
+    crop has a rotation set, rotate the small cached thumb on the fly (cheap)."""
     p = next((x for x in STATE["photos"] if x["id"] == pid), None)
     if not p:
         return "", 404
+    tp = _thumb_path(p["path"])
+    if not tp.exists():
+        make_thumb(p["path"])               # lazily build if missing (old crops)
+    if tp.exists():
+        if not p.get("rotation_cw"):
+            return send_file(str(tp), mimetype="image/jpeg")
+        img = apply_rotation(cv2.imread(str(tp)), p["rotation_cw"])
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 78])
+        return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
+    # fallback: original, rotated
     img = apply_rotation(cv2.imread(p["path"]), p["rotation_cw"])
-    h, w = img.shape[:2]
-    longest = max(h, w)
-    if longest > 320:
-        s = 320 / longest
-        img = cv2.resize(img, (int(w * s), int(h * s)),
-                         interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 78])
     return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
 
 
 @app.route("/api/full/<pid>")
 def full(pid):
-    """Full-resolution image (rotation applied) for the lightbox view."""
+    """Full-resolution image (rotation applied). For the lightbox view; with
+    ?download=1 it's sent as a named file attachment for per-crop download."""
     p = next((x for x in STATE["photos"] if x["id"] == pid), None)
     if not p:
         return "", 404
     img = apply_rotation(cv2.imread(p["path"]), p["rotation_cw"])
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 98])
+    if request.args.get("download") == "1":
+        fname = f"{Path(p['scan_name']).stem}_{p['id']}.jpg"
+        return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg",
+                         as_attachment=True, download_name=fname)
     return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
 
 
@@ -569,20 +645,16 @@ def scan_img(sid):
 
 @app.route("/api/scan_thumb/<sid>")
 def scan_thumb(sid):
-    """Downscaled scan thumbnail (longest edge 360px) for the scans list."""
+    """Serve the pre-generated cached scan thumbnail (built on upload)."""
     s = next((x for x in STATE["scans"] if x["id"] == sid), None)
     if not s:
         return "", 404
-    img = cv2.imread(s["path"])
-    if img is None:
-        return "", 404
-    h, w = img.shape[:2]
-    longest = max(h, w)
-    if longest > 360:
-        sc = 360 / longest
-        img = cv2.resize(img, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])
-    return send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
+    tp = _thumb_path(s["path"])
+    if not tp.exists():
+        make_thumb(s["path"], SCAN_THUMB_MAX)
+    if tp.exists():
+        return send_file(str(tp), mimetype="image/jpeg")
+    return send_file(s["path"], mimetype="image/jpeg")
 
 
 @app.route("/api/update", methods=["POST"])
@@ -616,24 +688,19 @@ def tag():
             return jsonify({"error": "No API key provided."}), 400
         model = j.get("model") or DEFAULT_MODEL
         run = lambda bgr, hint: claude_tag(bgr, hint, key, model)  # noqa: E731
-    ids = j.get("ids") or [p["id"] for p in STATE["photos"]
-                           if p["status"] == "keep" and not p["blank"]]
+    ids = j.get("ids") or [p["id"] for p in STATE["photos"]]
     done = []
     for pid in ids:
         p = next((x for x in STATE["photos"] if x["id"] == pid), None)
         if not p:
             continue
-        meta = run(cv2.imread(p["path"]), p["face_hint_cw"])
+        meta = run(cv2.imread(p["path"]), None)
         if "error" in meta:
             p["tag_error"] = meta["error"]
             done.append({"id": pid, "error": meta["error"]})
             continue
         p["tags"] = meta.get("tags", [])
         p["description"] = meta.get("description", "")
-        p["scene_type"] = meta.get("scene_type", "")
-        p["people_count"] = meta.get("people_count")
-        p["decade"] = meta.get("estimated_decade", "")
-        p["decade_confidence"] = meta.get("decade_confidence", "")
         rot = meta.get("correct_rotation_cw", p["rotation_cw"])
         if isinstance(rot, (int, float)):
             p["rotation_cw"] = int(rot) % 360
@@ -642,27 +709,47 @@ def tag():
     return jsonify({"results": done, "photos": STATE["photos"]})
 
 
+def _safe_folder(name):
+    """Sanitize a folder name for use as a directory."""
+    keep = "".join(c if (c.isalnum() or c in " -_") else "_" for c in name).strip()
+    return keep or "folder"
+
+
+def export_relpaths(p, foldered):
+    """Return the list of archive-relative paths a crop should be written to.
+    Flat: one path under corrected/. Foldered: one per folder it's in (duplicated),
+    or corrected/_unfiled/ if it's in none."""
+    fname = f"{Path(p['scan_name']).stem}_{p['id']}.jpg"
+    if not foldered:
+        return [f"corrected/{fname}"]
+    folders = p.get("folders", [])
+    if not folders:
+        return [f"corrected/_unfiled/{fname}"]
+    return [f"corrected/{_safe_folder(fl)}/{fname}" for fl in folders]
+
+
 @app.route("/api/export", methods=["POST"])
 def export():
-    out = Path((request.json or {}).get("out_dir", "")).expanduser()
+    j = request.json or {}
+    out = Path(j.get("out_dir", "")).expanduser()
+    foldered = bool(j.get("foldered", False))
     if not str(out):
         return jsonify({"error": "No output folder."}), 400
     (out / "corrected").mkdir(parents=True, exist_ok=True)
-    (out / "blank").mkdir(parents=True, exist_ok=True)
     rows, n = [], 0
     for p in STATE["photos"]:
         img = cv2.imread(p["path"])
-        if p["blank"] or p["status"] == "skip":
-            cv2.imwrite(str(out / "blank" / f"{p['scan_name']}_{p['id']}.jpg"), img)
-        else:
-            corrected = apply_rotation(img, p["rotation_cw"])
-            name = f"{Path(p['scan_name']).stem}_{p['index']:02d}_{p['id']}.jpg"
-            cv2.imwrite(str(out / "corrected" / name), corrected)
+        if img is None:
+            continue
+        corrected = apply_rotation(img, p["rotation_cw"])
+        for rel in export_relpaths(p, foldered):
+            dst = out / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(dst), corrected)
             n += 1
         rows.append({k: p.get(k) for k in (
-            "scan_name", "index", "id", "status", "blank", "dup_group",
-            "is_dup_copy", "rotation_cw", "scene_type", "people_count",
-            "decade", "decade_confidence", "description", "tags")})
+            "scan_name", "id", "rotation_cw", "tilt_cw",
+            "description", "tags", "folders")})
     with open(out / "manifest.json", "w") as f:
         json.dump(rows, f, indent=2, default=str)
     keys = list(rows[0].keys()) if rows else []
@@ -686,6 +773,14 @@ def download():
     photos = STATE["photos"]
     if not photos:
         return jsonify({"error": "Nothing to download — no photos."}), 400
+    j = request.json or {}
+    foldered = bool(j.get("foldered", False))
+    ids = j.get("ids")
+    if ids:
+        idset = set(ids)
+        photos = [p for p in photos if p["id"] in idset]
+        if not photos:
+            return jsonify({"error": "No matching crops."}), 400
 
     tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
     tmp_path = tmp.name
@@ -697,23 +792,16 @@ def download():
                 img = cv2.imread(p["path"])
                 if img is None:
                     continue
-                if p["blank"] or p["status"] == "skip":
-                    arc = f"blank/{p['scan_name']}_{p['id']}.jpg"
-                    ok, buf = cv2.imencode(".jpg", img,
-                                           [cv2.IMWRITE_JPEG_QUALITY, 92])
-                else:
-                    corrected = apply_rotation(img, p["rotation_cw"])
-                    arc = (f"corrected/{Path(p['scan_name']).stem}"
-                           f"_{p['index']:02d}_{p['id']}.jpg")
-                    ok, buf = cv2.imencode(".jpg", corrected,
-                                           [cv2.IMWRITE_JPEG_QUALITY, 92])
-                    n += 1
+                corrected = apply_rotation(img, p["rotation_cw"])
+                ok, buf = cv2.imencode(".jpg", corrected,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 92])
                 if ok:
-                    zf.writestr(arc, buf.tobytes())
+                    for rel in export_relpaths(p, foldered):
+                        zf.writestr(rel, buf.tobytes())
+                        n += 1
                 rows.append({k: p.get(k) for k in (
-                    "scan_name", "index", "id", "status", "blank", "dup_group",
-                    "is_dup_copy", "rotation_cw", "scene_type", "people_count",
-                    "decade", "decade_confidence", "description", "tags")})
+                    "scan_name", "id", "rotation_cw", "tilt_cw",
+                    "description", "tags", "folders")})
             zf.writestr("manifest.json",
                         json.dumps(rows, indent=2, default=str))
             keys = list(rows[0].keys()) if rows else []
@@ -742,6 +830,45 @@ def download():
 
     return send_file(tmp_path, mimetype="application/zip",
                      as_attachment=True, download_name="photo_studio_export.zip")
+
+
+@app.route("/api/backup", methods=["POST"])
+def backup():
+    """Stream a zip of the entire data dir (scans, crops, session.json) so the
+    whole workspace can be restored after a disk loss. Thumbnails are omitted —
+    they regenerate from the originals — keeping the backup smaller."""
+    save_session()                          # make sure session.json is current
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in sorted(WORK.glob("*")):
+                if not f.is_file():
+                    continue
+                if f.name.endswith("_thumb.jpg"):
+                    continue                # regenerated on demand
+                zf.write(str(f), arcname=f"photostudio_data/{f.name}")
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    @after_this_request
+    def _cleanup(resp):
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return resp
+
+    from datetime import datetime
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    return send_file(tmp_path, mimetype="application/zip",
+                     as_attachment=True,
+                     download_name=f"photostudio_backup_{stamp}.zip")
 
 
 # --------------------------------------------------------------------------- #
@@ -787,6 +914,9 @@ button{cursor:pointer;border:1px solid var(--line);background:var(--panel2);
   font-family:inherit;transition:.15s}
 button:hover{border-color:var(--accent);color:#fff}
 button.primary{background:var(--accent);color:#1a160c;border-color:var(--accent);font-weight:600}
+button.danger{background:transparent;border:1px solid var(--warn);color:var(--warn);font-weight:600}
+button.danger:hover{background:var(--warn);color:#1a0d09;border-color:var(--warn)}
+.danger-zone{margin-top:28px;padding-top:14px;border-top:1px dashed var(--warn)}
 button.primary:hover{filter:brightness(1.08)}
 .row{display:flex;gap:8px;align-items:center}
 .drop{border:1.5px dashed var(--line);border-radius:var(--radius);padding:18px;
@@ -799,11 +929,33 @@ button.primary:hover{filter:brightness(1.08)}
   max-height:140px;overflow:auto;margin-bottom:8px}
 .filelist .fl{display:flex;justify-content:space-between;gap:6px;padding:2px 0;
   white-space:nowrap}
+.filelist .fl-link{cursor:pointer;border-radius:4px;padding:2px 4px;margin:0 -4px}
+.filelist .fl-link:hover{background:var(--panel2);color:var(--ink)}
+.folderlist{display:flex;flex-direction:column;gap:4px}
+.frow{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;
+  border:1px solid var(--line);background:var(--panel2);font-size:13px;cursor:pointer}
+.frow:hover{border-color:var(--accent)}
+.frow.active{border-color:var(--accent);background:rgba(224,162,59,.14)}
+.frow.dragover{border-color:var(--accent2);background:rgba(127,174,111,.18)}
+.frow .fn{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.frow .fc{color:var(--mut);font-family:ui-monospace,monospace;font-size:11px}
+.frow .fx{color:var(--warn);cursor:pointer;padding:0 2px}
+.card.dragging{opacity:.5}
+.cardfolders{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.fchip{font-size:10px;padding:1px 6px;border-radius:12px;background:var(--panel2);
+  border:1px solid var(--accent2);color:var(--accent2);display:flex;gap:3px;align-items:center}
+.fchip .x{cursor:pointer;color:var(--warn)}
 .filelist .fl .nm{overflow:hidden;text-overflow:ellipsis}
 .filelist .fl .ct{color:var(--accent2);flex:0 0 auto}
 .filelist .hd{color:var(--ink);text-transform:uppercase;letter-spacing:1px;
   font-size:10px;margin:2px 0 4px}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.selbar{display:flex;align-items:center;gap:8px;padding:4px 10px;border:1px solid var(--accent);
+  border-radius:8px;background:rgba(224,162,59,.12);font-size:13px}
+.selbar b{color:var(--accent)}
+.selbar button{padding:5px 9px;font-size:12px}
+.selchk{position:absolute;top:6px;right:6px;width:20px;height:20px;cursor:pointer;z-index:2;accent-color:var(--accent)}
+.card.selected{outline:2px solid var(--accent);outline-offset:-2px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
 .slgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;width:100%}
 .scard{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
@@ -880,13 +1032,26 @@ button.primary:hover{filter:brightness(1.08)}
     <input type="file" id="fileInput" accept="image/*" multiple style="display:none" onchange="uploadFiles(this.files)">
     <button class="primary" style="width:100%" onclick="document.getElementById('fileInput').click()">Choose scan images…</button>
     <div class="drop" id="drop">…or drop scan images here</div>
-    <button onclick="clearSession()" style="width:100%;margin-top:8px">New session (clear)</button>
-    <button onclick="openEditor()" style="width:100%;margin-top:8px">&#9986; Manual crop (draw boxes)</button>
+  </div>
+  <div class="group">
+    <h3>2 · Crop</h3>
+    <button class="primary" style="width:100%" onclick="openEditor()">&#9986; Crop scans (draw boxes)</button>
+    <div class="note">Open the scan list, then draw a box around each photo.</div>
+  </div>
+  <div class="group">
+    <h3>Folders</h3>
+    <div id="folderList" class="folderlist"></div>
+    <div class="row" style="margin-top:8px;gap:6px">
+      <input type="text" id="newFolder" placeholder="New folder" style="flex:1"
+             onkeydown="if(event.key==='Enter')createFolder()">
+      <button onclick="createFolder()">Add</button>
+    </div>
+    <div class="note">Drag a crop onto a folder to label it. Click a folder to filter.</div>
   </div>
   <!-- Detection / autocrop panel hidden until autocrop is fixed.
        The detect() backend + JS remain; restore this block to re-enable.
   <div class="group">
-    <h3>2 · Detection</h3>
+    <h3>Detection</h3>
     <label>Sensitivity <span id="sv">1.0</span></label>
     <input type="range" id="sens" min="0.4" max="1.8" step="0.05" value="1.0" oninput="sv.textContent=this.value">
     <label>Min photo size (% of scan) <span id="mv">1</span></label>
@@ -898,37 +1063,53 @@ button.primary:hover{filter:brightness(1.08)}
   </div>
   -->
   <div class="group">
-    <h3>2 · Export</h3>
+    <h3>3 · Export</h3>
     <button class="primary" style="width:100%" onclick="doDownload()">Download .zip</button>
-    <div class="note">Downloads corrected photos, blanks, and manifests (CSV + JSON) to your computer.</div>
+    <label class="row" style="gap:8px;margin-top:8px"><input type="checkbox" id="exportFoldered" style="width:auto"> organize into folder subdirectories</label>
+    <div class="note">Downloads all cropped photos + manifests (CSV + JSON). Foldered mode duplicates a crop into each folder it's in; unfiled crops go to <code>_unfiled</code>.</div>
+    <button style="width:100%;margin-top:10px" onclick="doBackup()">⤓ Download full backup</button>
+    <div class="note">A zip of everything (scans, crops, folders/tags) you can keep safe or restore from.</div>
   </div>
   <div class="group">
     <h3>Summary</h3>
     <div class="stat"><span>Scans</span><b id="nScans">0</b></div>
-    <div class="stat"><span>Photos</span><b id="nPhotos">0</b></div>
-    <div class="stat"><span>Blank</span><b id="nBlank">0</b></div>
-    <div class="stat"><span>Duplicate copies</span><b id="nDup">0</b></div>
-    <div class="stat"><span>Keeping</span><b id="nKeep">0</b></div>
+    <div class="stat"><span>Crops</span><b id="nPhotos">0</b></div>
   </div>
   <div class="group">
     <h3>Files</h3>
     <div class="filelist" id="fileScans"></div>
     <div class="filelist" id="fileCrops"></div>
   </div>
+  <div class="group danger-zone">
+    <button class="danger" style="width:100%" onclick="clearSession()">⚠ Clear session — delete everything</button>
+  </div>
 </aside>
 <main>
   <div class="toolbar">
-    <label class="row" style="margin:0;gap:6px"><input type="checkbox" id="showBlank" style="width:auto" onchange="render()"> show blanks</label>
-    <label class="row" style="margin:0;gap:6px"><input type="checkbox" id="showDup" style="width:auto" onchange="render()"> show duplicate copies</label>
+    <label class="row" style="margin:0;gap:8px">thumb size
+      <input type="range" id="cropSize" min="160" max="340" step="20" value="220"
+             style="width:140px" oninput="setCropSize(this.value)"></label>
+    <span id="selBar" class="selbar" style="display:none">
+      <b id="selCount">0</b> selected
+      <button onclick="bulkFolder('add')">＋ folder</button>
+      <button onclick="bulkFolder('remove')">－ folder</button>
+      <button onclick="bulkMeta()">desc/tags</button>
+      <button onclick="bulkDownload()">⬇ zip</button>
+      <button class="danger" onclick="bulkDelete()">🗑 delete</button>
+      <button onclick="clearSel()">clear</button>
+    </span>
   </div>
   <div id="grid" class="grid"></div>
-  <div id="empty" class="empty">Load or drop scans, then use <b>Manual crop</b> to draw boxes around each photo.</div>
+  <div id="empty" class="empty">Use <b>Crop scans</b> to draw boxes around each photo.</div>
 </main>
 </div>
 <div class="modal" id="scansList">
   <div class="ehead">
     <h2>Scans <span class="einfo" id="slCount"></span></h2>
     <span class="einfo">Click a scan to crop it. The badge shows how many photos you've cropped from it.</span>
+    <label class="einfo" style="margin-left:14px">size
+      <input type="range" id="scanSize" min="140" max="320" step="20" value="200"
+             style="vertical-align:middle;width:120px" oninput="setScanSize(this.value)"></label>
     <button style="margin-left:auto" onclick="closeScansList()">Close</button>
   </div>
   <div class="ebody" style="align-items:flex-start"><div id="slGrid" class="slgrid"></div></div>
@@ -969,7 +1150,7 @@ button.primary:hover{filter:brightness(1.08)}
   <div class="lbbody"><img id="lbImg" src="" alt=""></div>
 </div>
 <script>
-let photos=[], scans=[];
+let photos=[], scans=[], folders=[], activeFolder=null, selected=new Set();
 const $=id=>document.getElementById(id);
 function setStatus(t,busy){
   const el=$("status");
@@ -982,7 +1163,7 @@ function openLightbox(id){
   const p=photos.find(x=>x.id===id); if(!p)return;
   lbId=id;
   $("lbImg").src='/api/full/'+p.id+'?r='+p.rotation_cw+'&t='+Date.now();
-  $("lbName").textContent=p.scan_name+' · #'+p.index;
+  $("lbName").textContent=p.scan_name;
   $("lbMeta").textContent=p.w+'×'+p.h+' px';
   const t=p.tilt_cw||0;
   $("lbTilt").value=t; $("lbTiltVal").textContent=t.toFixed(1)+'°';
@@ -1045,13 +1226,9 @@ async function rotate(id,dir){
   const p=photos.find(x=>x.id===id); p.rotation_cw=((p.rotation_cw+dir*90)%360+360)%360;
   await api('/api/update',{id,rotation_cw:p.rotation_cw}); render();
 }
-async function toggleKeep(id){
-  const p=photos.find(x=>x.id===id); p.status=p.status==='keep'?'skip':'keep';
-  await api('/api/update',{id,status:p.status}); render();
-}
 async function editTags(id){
   const p=photos.find(x=>x.id===id);
-  const v=prompt('Tags (comma-separated):',p.tags.join(', ')); if(v===null)return;
+  const v=prompt('Tags (comma-separated):',(p.tags||[]).join(', ')); if(v===null)return;
   const r=await api('/api/update',{id,tags:v}); p.tags=r.photo.tags; render();
 }
 async function editDesc(id){
@@ -1059,18 +1236,155 @@ async function editDesc(id){
   const v=prompt('Description:',p.description||''); if(v===null)return;
   const r=await api('/api/update',{id,description:v}); p.description=r.photo.description; render();
 }
+// Combined description + tags editor (one prompt each, sequentially).
+async function openMeta(id){
+  const p=photos.find(x=>x.id===id); if(!p)return;
+  const d=prompt('Description:',p.description||'');
+  if(d!==null){ const r=await api('/api/update',{id,description:d}); p.description=r.photo.description; }
+  const t=prompt('Tags (comma-separated):',(p.tags||[]).join(', '));
+  if(t!==null){ const r=await api('/api/update',{id,tags:t}); p.tags=r.photo.tags; }
+  render();
+}
 async function deleteCrop(id){
   if(!confirm('Delete this crop? Its dimmed region on the scan will clear too.'))return;
   const r=await api('/api/delete_crop',{id});
   if(r.error){setStatus(r.error);return;}
   photos=r.photos; setStatus('crop deleted'); render();
 }
-async function undupe(id){
-  const r=await api('/api/undupe',{id});
+async function doBackup(){
+  setStatus('building backup…',true);
+  try{
+    const resp=await fetch('/api/backup',{method:'POST'});
+    if(!resp.ok){ setStatus('backup failed'); return; }
+    const blob=await resp.blob();
+    const cd=resp.headers.get('Content-Disposition')||'';
+    const m=cd.match(/filename=([^;]+)/);
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download=(m?m[1]:'photostudio_backup.zip');
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    setStatus('backup downloaded');
+  }catch(e){ setStatus('backup error: '+e); }
+}
+function downloadCrop(id){
+  const p=photos.find(x=>x.id===id); if(!p)return;
+  const a=document.createElement('a');
+  a.href='/api/full/'+id+'?download=1&r='+p.rotation_cw+'&v='+(p.tilt_cw||0);
+  a.download='';   // server sets the filename via Content-Disposition
+  document.body.appendChild(a); a.click(); a.remove();
+}
+function toggleSel(id){
+  if(selected.has(id)) selected.delete(id); else selected.add(id);
+  updateSelBar();
+  // toggle just this card's class without full re-render
+  render();
+}
+function clearSel(){ selected.clear(); updateSelBar(); render(); }
+function updateSelBar(){
+  // prune ids no longer present
+  const present=new Set(photos.map(p=>p.id));
+  for(const id of [...selected]) if(!present.has(id)) selected.delete(id);
+  const bar=$("selBar"), n=selected.size;
+  if(bar){ bar.style.display=n?'inline-flex':'none'; $("selCount").textContent=n; }
+}
+function selIds(){ return [...selected]; }
+async function bulkFolder(action){
+  if(!selected.size)return;
+  if(!folders.length){ setStatus('create a folder first'); return; }
+  const name=prompt((action==='add'?'Add selected to which folder?':'Remove selected from which folder?')+'\n'+folders.join(', '));
+  if(!name)return;
+  if(!folders.includes(name)){ setStatus('no such folder: '+name); return; }
+  const r=await api('/api/folder_assign_bulk',{ids:selIds(),name,action});
   if(r.error){setStatus(r.error);return;}
-  const p=photos.find(x=>x.id===id);
-  if(p){ p.is_dup_copy=r.photo.is_dup_copy; p.status=r.photo.status; p.force_keep=true; }
-  setStatus('marked as not a duplicate'); render();
+  photos=r.photos; setStatus((action==='add'?'added to ':'removed from ')+name); render();
+}
+async function bulkMeta(){
+  if(!selected.size)return;
+  const d=prompt('Set description for '+selected.size+' selected (blank = skip):');
+  const t=prompt('Set tags (comma-separated) for selected (blank = skip):');
+  const body={ids:selIds()};
+  if(d!==null && d!=='') body.description=d;
+  if(t!==null && t!=='') body.tags=t;
+  if(!('description' in body) && !('tags' in body)) return;
+  const r=await api('/api/update_bulk',body);
+  if(r.error){setStatus(r.error);return;}
+  photos=r.photos; setStatus('updated '+selected.size+' crop(s)'); render();
+}
+async function bulkDownload(){
+  if(!selected.size)return;
+  setStatus('building zip…',true);
+  const foldered=!!($("exportFoldered")&&$("exportFoldered").checked);
+  try{
+    const resp=await fetch('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ids:selIds(),foldered})});
+    if(!resp.ok){setStatus('download failed');return;}
+    const blob=await resp.blob(); const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download='selected_crops.zip';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    setStatus('downloaded '+selected.size+' crop(s)');
+  }catch(e){ setStatus('download error: '+e); }
+}
+async function bulkDelete(){
+  if(!selected.size)return;
+  if(!confirm('Delete '+selected.size+' selected crop(s)? This cannot be undone.'))return;
+  const r=await api('/api/delete_crops',{ids:selIds()});
+  if(r.error){setStatus(r.error);return;}
+  photos=r.photos; const n=r.removed; selected.clear();
+  setStatus('deleted '+n+' crop(s)'); render();
+}
+async function createFolder(){
+  const name=$("newFolder").value.trim(); if(!name)return;
+  const r=await api('/api/folder_create',{name});
+  if(r.error){setStatus(r.error);return;}
+  folders=r.folders; $("newFolder").value=''; renderFolders();
+}
+async function deleteFolder(name){
+  if(!confirm('Delete folder "'+name+'"? Crops keep existing; they just lose this label.'))return;
+  const r=await api('/api/folder_delete',{name});
+  if(r.error){setStatus(r.error);return;}
+  folders=r.folders; photos=r.photos;
+  if(activeFolder===name) activeFolder=null;
+  render();
+}
+async function assignFolder(id,name,action){
+  const r=await api('/api/folder_assign',{id,name,action});
+  if(r.error){setStatus(r.error);return;}
+  const p=photos.find(x=>x.id===id); if(p) p.folders=r.photo.folders;
+  render();
+}
+function filterFolder(name){
+  activeFolder = (activeFolder===name) ? null : name;
+  render();
+}
+function renderFolders(){
+  const el=$("folderList"); if(!el)return;
+  const allRow=`<div class="frow ${activeFolder===null?'active':''}" onclick="filterFolder(null)">
+    <span class="fn">All crops</span><span class="fc">${photos.length}</span></div>`;
+  const unfiledN=photos.filter(p=>!(p.folders&&p.folders.length)).length;
+  const unfiledRow=`<div class="frow ${activeFolder==='__unfiled'?'active':''}" onclick="filterFolder('__unfiled')">
+    <span class="fn">Unfiled</span><span class="fc">${unfiledN}</span></div>`;
+  const rows=folders.map((name,i)=>{
+    const n=photos.filter(p=>(p.folders||[]).includes(name)).length;
+    return `<div class="frow ${activeFolder===name?'active':''}"
+        ondragover="event.preventDefault();this.classList.add('dragover')"
+        ondragleave="this.classList.remove('dragover')"
+        ondrop="onFolderDrop(event,${i})"
+        onclick="filterFolderIdx(${i})">
+      <span class="fn">${name}</span>
+      <span class="fc">${n}</span>
+      <span class="fx" onclick="event.stopPropagation();deleteFolderIdx(${i})" title="Delete folder">✕</span>
+    </div>`;
+  }).join('');
+  el.innerHTML=allRow+unfiledRow+rows;
+}
+function filterFolderIdx(i){ filterFolder(folders[i]); }
+function deleteFolderIdx(i){ deleteFolder(folders[i]); }
+function onFolderDrop(e,i){
+  e.preventDefault();
+  e.currentTarget.classList.remove('dragover');
+  const id=e.dataTransfer.getData('text/plain');
+  if(id) assignFolder(id, folders[i], 'add');
 }
 async function retilt(id, deg){
   const r=await api('/api/retilt',{id, tilt_cw:parseFloat(deg)});
@@ -1081,9 +1395,10 @@ async function retilt(id, deg){
 }
 async function doDownload(){
   setStatus('building zip…',true);
+  const foldered = !!($("exportFoldered") && $("exportFoldered").checked);
   try{
     const resp=await fetch('/api/download',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:'{}'});
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({foldered})});
     if(!resp.ok){
       let msg='download failed';
       try{ msg=(await resp.json()).error||msg; }catch(e){}
@@ -1100,11 +1415,8 @@ async function doDownload(){
 }
 function counts(){
   $("nPhotos").textContent=photos.length;
-  $("nBlank").textContent=photos.filter(p=>p.blank).length;
-  $("nDup").textContent=photos.filter(p=>p.is_dup_copy).length;
-  $("nKeep").textContent=photos.filter(p=>p.status==='keep').length;
   const nc=$("navCount"); if(nc) nc.textContent=photos.length;
-  renderFiles();
+  renderFiles(); renderFolders(); updateSelBar();
 }
 function gotoReview(){
   // The crop-review grid IS the main view; bring it into focus.
@@ -1112,52 +1424,57 @@ function gotoReview(){
   document.getElementById('grid').scrollIntoView({behavior:'smooth',block:'start'});
 }
 function renderFiles(){
-  // Uploaded scans, each with how many crops came from it.
   const fs=$("fileScans"), fc=$("fileCrops");
   if(fs){
     fs.innerHTML='<div class="hd">Uploaded ('+scans.length+')</div>'+
-      (scans.length? scans.map(s=>{
+      (scans.length? scans.map((s,idx)=>{
         const n=photos.filter(p=>p.scan_id===s.id).length;
-        return `<div class="fl"><span class="nm">${s.name}</span><span class="ct">${n} crop${n!==1?'s':''}</span></div>`;
+        return `<div class="fl fl-link" onclick="openEditorAt(${idx})" title="Open in crop editor"><span class="nm">${s.name}</span><span class="ct">${n} crop${n!==1?'s':''}</span></div>`;
       }).join('') : '<div class="fl"><span class="nm">none yet</span></div>');
   }
   if(fc){
     fc.innerHTML='<div class="hd">Created ('+photos.length+')</div>'+
       (photos.length? photos.map(p=>
-        `<div class="fl"><span class="nm">${p.scan_name} · #${p.index}</span><span class="ct">${p.w}×${p.h}</span></div>`
+        `<div class="fl fl-link" onclick="openLightbox('${p.id}')" title="View full size"><span class="nm">${p.scan_name}</span><span class="ct">${p.w}×${p.h}</span></div>`
       ).join('') : '<div class="fl"><span class="nm">none yet</span></div>');
   }
 }
 function render(){
   counts();
-  const showB=$("showBlank").checked, showD=$("showDup").checked;
-  const vis=photos.filter(p=>(showB||!p.blank)&&(showD||!p.is_dup_copy));
+  let vis=photos;
+  if(activeFolder==='__unfiled') vis=photos.filter(p=>!(p.folders&&p.folders.length));
+  else if(activeFolder!==null) vis=photos.filter(p=>(p.folders||[]).includes(activeFolder));
   $("empty").style.display=vis.length?'none':'block';
   $("grid").innerHTML=vis.map(p=>{
-    const badges=[`<span class="badge grp">grp ${p.dup_group}</span>`,
-      p.rotation_cw?`<span class="badge">↻${p.rotation_cw}°</span>`:'',
-      p.is_dup_copy?`<span class="badge dup">dup</span>`:'',
-      p.blank?`<span class="badge blank">blank</span>`:''].join('');
-    const tags=p.tags.map(t=>`<span class="tag">${t}</span>`).join('');
-    return `<div class="card ${p.status==='skip'?'skip':''}">
-      <div class="thumbwrap"><img src="/api/thumb/${p.id}?r=${p.rotation_cw}" loading="lazy" onclick="openLightbox('${p.id}')" title="Click to view full size">
-        <div class="badges">${badges}</div></div>
+    const tags=(p.tags||[]).map(t=>`<span class="tag">${t}</span>`).join('');
+    const tiltBadge=p.tilt_cw?`<span class="badge">∠${(+p.tilt_cw).toFixed(1)}°</span>`:'';
+    const rotBadge=p.rotation_cw?`<span class="badge">↻${p.rotation_cw}°</span>`:'';
+    const chips=(p.folders||[]).map(f=>
+      `<span class="fchip">${f}<span class="x" onclick='assignFolder(${JSON.stringify(p.id)},${JSON.stringify(f)},"remove")' title="Remove from folder">✕</span></span>`).join('');
+    return `<div class="card${selected.has(p.id)?' selected':''}" draggable="true"
+        ondragstart="event.dataTransfer.setData('text/plain','${p.id}');this.classList.add('dragging')"
+        ondragend="this.classList.remove('dragging')">
+      <div class="thumbwrap"><img src="/api/thumb/${p.id}?r=${p.rotation_cw}&v=${p.tilt_cw||0}" loading="lazy" onclick="openLightbox('${p.id}')" title="Click to view full size">
+        <input type="checkbox" class="selchk" ${selected.has(p.id)?'checked':''} onclick="event.stopPropagation();toggleSel('${p.id}')" title="Select">
+        <div class="badges">${rotBadge}${tiltBadge}</div></div>
       <div class="cardbody">
-        <div class="nm">${p.scan_name} · #${p.index}</div>
-        <div class="desc">${p.description||'<span style="color:var(--mut)">no description</span>'}</div>
-        <div class="tags">${tags}</div>
-        <div class="meta"><span>${p.added_by&&p.added_by!=='local'?p.added_by:''}</span><span></span></div>
+        <div class="nm">${p.scan_name}</div>
+        ${p.description?`<div class="desc">${p.description}</div>`:''}
+        ${tags?`<div class="tags">${tags}</div>`:''}
+        ${chips?`<div class="cardfolders">${chips}</div>`:''}
       </div>
       <div class="cardctl">
-        <button onclick="rotate('${p.id}',-1)">↺</button>
-        <button onclick="rotate('${p.id}',1)">↻</button>
-        <button class="grow" onclick="editDesc('${p.id}')">desc</button>
-        <button class="grow" onclick="editTags('${p.id}')">tags</button>
-        ${p.is_dup_copy?`<button onclick="undupe('${p.id}')" title="Not a duplicate — keep it">undup</button>`:''}
-        <button onclick="toggleKeep('${p.id}')">${p.status==='keep'?'keep':'skip'}</button>
+        <button onclick="rotate('${p.id}',-1)" title="Rotate left">↺</button>
+        <button onclick="rotate('${p.id}',1)" title="Rotate right">↻</button>
+        <button class="grow" onclick="openMeta('${p.id}')">Description &amp; tags</button>
+        <button onclick="downloadCrop('${p.id}')" title="Download this crop">⬇</button>
         <button onclick="deleteCrop('${p.id}')" title="Delete crop">🗑</button>
       </div></div>`;
   }).join('');
+}
+function setCropSize(px){
+  document.getElementById('grid').style.gridTemplateColumns=
+    'repeat(auto-fill,minmax('+px+'px,1fr))';
 }
 // drag & drop upload
 const drop=$("drop");
@@ -1173,7 +1490,7 @@ let lastRev=0;
 async function init(){
   try{
     const r=await(await fetch('/api/state')).json();
-    scans=r.scans||[]; photos=r.photos||[]; lastRev=r.rev||0;
+    scans=r.scans||[]; photos=r.photos||[]; folders=r.folders||[]; lastRev=r.rev||0;
     $("nScans").textContent=scans.length;
     renderFiles();
     if(photos.length){ setStatus('restored '+photos.length+' photo(s) from last session'); render(); }
@@ -1192,7 +1509,7 @@ async function syncShared(){
     const r=await(await fetch('/api/rev')).json();
     if((r.rev||0)===lastRev)return;
     const st=await(await fetch('/api/state')).json();
-    scans=st.scans||[]; photos=st.photos||[]; lastRev=st.rev||0;
+    scans=st.scans||[]; photos=st.photos||[]; folders=st.folders||[]; lastRev=st.rev||0;
     $("nScans").textContent=scans.length; render();
   }catch(e){}
 }
@@ -1219,6 +1536,10 @@ function renderScansList(){
       <div class="sthumb"><img src="/api/scan_thumb/${s.id}" loading="lazy"></div>
       <div class="sname">${s.name}</div>${badge}</div>`;
   }).join('');
+  const sz=$("scanSize"); if(sz) setScanSize(sz.value);
+}
+function setScanSize(px){
+  $("slGrid").style.gridTemplateColumns='repeat(auto-fill,minmax('+px+'px,1fr))';
 }
 function openEditor(){ openScansList(); }   // entry point -> scans list first
 function openEditorAt(idx){
