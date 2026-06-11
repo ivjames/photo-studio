@@ -876,7 +876,7 @@ def backup():
 # --------------------------------------------------------------------------- #
 PAGE = r"""<!doctype html>
 <html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>Photo Studio</title>
 <style>
 :root{
@@ -908,6 +908,12 @@ label{display:block;font-size:13px;margin:10px 0 4px;color:var(--mut)}
 input[type=text],input[type=password],input[type=number]{width:100%;padding:8px 10px;
   background:var(--panel2);border:1px solid var(--line);border-radius:8px;
   color:var(--ink);font-family:ui-monospace,monospace;font-size:13px}
+/* iOS Safari zooms toward any input whose text is under 16px on focus, even with
+   user-scalable=no. On touch/coarse-pointer devices, raise inputs to 16px so
+   focusing a field never rescales the page. Desktop keeps the tighter 13px. */
+@media (pointer:coarse){
+  input[type=text],input[type=password],input[type=number]{font-size:16px}
+}
 input[type=range]{width:100%;accent-color:var(--accent)}
 button{cursor:pointer;border:1px solid var(--line);background:var(--panel2);
   color:var(--ink);padding:9px 14px;border-radius:8px;font-size:13px;
