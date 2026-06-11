@@ -1009,6 +1009,15 @@ button.primary:hover{filter:brightness(1.08)}
 .modal{position:fixed;inset:0;background:rgba(10,9,6,.94);z-index:50;display:none;
   flex-direction:column;padding:14px 18px}
 .modal.open{display:flex}
+.dialog{margin:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:18px 20px;width:min(440px,92vw);max-height:80vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.fplist{display:flex;flex-direction:column;gap:6px}
+.fpitem{display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);
+  cursor:pointer;font-size:14px}
+.fpitem:hover{border-color:var(--accent);color:#fff}
+.fpitem .cnt{color:var(--mut);font-family:ui-monospace,monospace;font-size:11px}
+.fpempty{color:var(--mut);font-style:italic;padding:8px 0}
 .ehead{display:flex;align-items:center;gap:12px;margin-bottom:10px}
 .ehead h2{font-size:16px;margin:0}
 .ebody{flex:1;overflow:auto;display:flex;justify-content:center;align-items:flex-start}
@@ -1113,6 +1122,21 @@ button.primary:hover{filter:brightness(1.08)}
     <button style="margin-left:auto" onclick="closeScansList()">Close</button>
   </div>
   <div class="ebody" style="align-items:flex-start"><div id="slGrid" class="slgrid"></div></div>
+</div>
+<div class="modal" id="folderPick" onclick="if(event.target.id==='folderPick')closeFolderPick()">
+  <div class="dialog">
+    <div class="ehead">
+      <h2 id="fpTitle">Add to folder</h2>
+      <button style="margin-left:auto" onclick="closeFolderPick()">Close</button>
+    </div>
+    <div class="einfo" id="fpSub" style="margin-bottom:10px"></div>
+    <div id="fpList" class="fplist"></div>
+    <div id="fpNew" class="row" style="margin-top:12px;gap:6px">
+      <input type="text" id="fpNewName" placeholder="New folder name" style="flex:1"
+             onkeydown="if(event.key==='Enter')fpCreateAndAssign()">
+      <button class="primary" onclick="fpCreateAndAssign()">Create &amp; add</button>
+    </div>
+  </div>
 </div>
 <div class="modal" id="editor">
   <div class="ehead">
@@ -1289,15 +1313,46 @@ function updateSelBar(){
   if(bar){ bar.style.display=n?'inline-flex':'none'; $("selCount").textContent=n; }
 }
 function selIds(){ return [...selected]; }
-async function bulkFolder(action){
+let fpAction='add';
+function bulkFolder(action){
   if(!selected.size)return;
-  if(!folders.length){ setStatus('create a folder first'); return; }
-  const name=prompt((action==='add'?'Add selected to which folder?':'Remove selected from which folder?')+'\n'+folders.join(', '));
-  if(!name)return;
-  if(!folders.includes(name)){ setStatus('no such folder: '+name); return; }
-  const r=await api('/api/folder_assign_bulk',{ids:selIds(),name,action});
+  fpAction=action;
+  $("fpTitle").textContent = action==='add' ? 'Add to folder' : 'Remove from folder';
+  $("fpSub").textContent = (action==='add'?'Add ':'Remove ')+selected.size+' selected crop'+(selected.size!==1?'s':'')+(action==='add'?' to:':' from:');
+  $("fpNew").style.display = action==='add' ? 'flex' : 'none';   // creation only when adding
+  renderFolderPick();
+  $("folderPick").classList.add('open');
+  if(action==='add') $("fpNewName").value='';
+}
+function closeFolderPick(){ $("folderPick").classList.remove('open'); }
+function renderFolderPick(){
+  const el=$("fpList");
+  if(!folders.length){
+    el.innerHTML='<div class="fpempty">No folders yet.'+(fpAction==='add'?' Create one below.':'')+'</div>';
+    return;
+  }
+  el.innerHTML=folders.map((name,i)=>{
+    const n=photos.filter(p=>(p.folders||[]).includes(name)).length;
+    return `<div class="fpitem" onclick="fpPick(${i})"><span>${name}</span><span class="cnt">${n}</span></div>`;
+  }).join('');
+}
+async function fpPick(i){
+  const name=folders[i];
+  const r=await api('/api/folder_assign_bulk',{ids:selIds(),name,action:fpAction});
   if(r.error){setStatus(r.error);return;}
-  photos=r.photos; setStatus((action==='add'?'added to ':'removed from ')+name); render();
+  photos=r.photos;
+  setStatus((fpAction==='add'?'added to ':'removed from ')+name);
+  closeFolderPick(); render();
+}
+async function fpCreateAndAssign(){
+  const name=$("fpNewName").value.trim(); if(!name)return;
+  const cr=await api('/api/folder_create',{name});
+  if(cr.error){setStatus(cr.error);return;}
+  folders=cr.folders;
+  const r=await api('/api/folder_assign_bulk',{ids:selIds(),name,action:'add'});
+  if(r.error){setStatus(r.error);return;}
+  photos=r.photos; setStatus('created and added to '+name);
+  closeFolderPick(); render();
 }
 async function bulkMeta(){
   if(!selected.size)return;
